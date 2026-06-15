@@ -360,15 +360,26 @@ impl AttentionWeights {
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let q = q.contiguous()?;
             let attn_mask = normalize_sdpa_mask(attn_mask, &q, &k)?;
-            let ctx = candle_nn::ops::sdpa(
-                &q,
-                &k,
-                &v,
-                attn_mask.as_ref(),
-                attn_mask.is_none() && l > 1,
-                scale,
-                1.0, // no softcapping
-            )?;
+            // ops::sdpa is a Metal-only custom op — fall back to standard matmul
+            // attention on CUDA (and any other non-Metal device).
+            let ctx = if q.device().is_metal() {
+                candle_nn::ops::sdpa(
+                    &q,
+                    &k,
+                    &v,
+                    attn_mask.as_ref(),
+                    attn_mask.is_none() && l > 1,
+                    scale,
+                    1.0,
+                )?
+            } else {
+                let scores = (q.matmul(&k.transpose(2, 3)?)? * scale as f64)?;
+                let scores = match attn_mask.as_ref() {
+                    Some(m) => scores.broadcast_add(m)?,
+                    None => scores,
+                };
+                candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?
+            };
 
             let reshaped_ctx = ctx.transpose(1, 2)?.reshape((b, l, self.hidden_size))?;
             self.o_proj.forward(&reshaped_ctx)
