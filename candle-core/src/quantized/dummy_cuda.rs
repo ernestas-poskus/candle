@@ -53,6 +53,16 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    pub fn fwd_glu(
+        &self,
+        _up: &QCudaStorage,
+        _self_shape: &crate::Shape,
+        _storage: &CudaStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(CudaStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn indexed_moe_forward(
         &self,
         _: &crate::Shape,

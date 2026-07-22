@@ -735,6 +735,83 @@ impl crate::CustomOp1 for QTensor {
     }
 }
 
+/// Fused SwiGLU over two same-shape quantized projections:
+/// `silu(gate·xs) * (up·xs)` in one kernel with the activation quantized
+/// once (CUDA, Q4K, decode-width batches only — see
+/// `QCudaStorage::fwd_glu`).
+struct QGluOp {
+    gate: std::sync::Arc<QTensor>,
+    up: std::sync::Arc<QTensor>,
+}
+
+impl crate::CustomOp1 for QGluOp {
+    fn name(&self) -> &'static str {
+        "qglu-matmul"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &crate::CpuStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(crate::CpuStorage, Shape)> {
+        crate::bail!("qglu-matmul is cuda-only; use the unfused gate/up path")
+    }
+
+    fn cuda_fwd(
+        &self,
+        storage: &crate::CudaStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::CudaStorage, Shape)> {
+        let gate_storage = match &self.gate.storage {
+            QStorage::Cuda(cuda) => cuda,
+            _ => crate::bail!("qglu-matmul requires cuda qtensors"),
+        };
+        let up_storage = match &self.up.storage {
+            QStorage::Cuda(cuda) => cuda,
+            _ => crate::bail!("qglu-matmul requires cuda qtensors"),
+        };
+        gate_storage.fwd_glu(up_storage, &self.gate.shape, storage, layout)
+    }
+}
+
+/// Fused SwiGLU forward for a gate/up projection pair sharing one input.
+/// Returns `Ok(None)` when the fused path does not apply (non-`QTensor`
+/// operands, non-CUDA device, non-Q4K weights, mismatched shapes, or a
+/// batch wider than the mmvq decode kernels support) so callers can fall
+/// back to the unfused ops at zero cost.
+pub fn fused_swiglu_forward(
+    gate: &QMatMul,
+    up: &QMatMul,
+    xs: &Tensor,
+) -> Result<Option<Tensor>> {
+    let (gate_t, up_t) = match (gate, up) {
+        (QMatMul::QTensor(g), QMatMul::QTensor(u)) => (g, u),
+        _ => return Ok(None),
+    };
+    if !matches!(gate_t.device(), Device::Cuda(_)) {
+        return Ok(None);
+    }
+    if gate_t.dtype() != GgmlDType::Q4K || up_t.dtype() != GgmlDType::Q4K {
+        return Ok(None);
+    }
+    if gate_t.shape() != up_t.shape() {
+        return Ok(None);
+    }
+    let b_size = match *xs.dims() {
+        [b, m, _k] => b * m,
+        [b, _k] => b,
+        _ => return Ok(None),
+    };
+    if b_size == 0 || b_size > 8 {
+        return Ok(None);
+    }
+    let op = QGluOp {
+        gate: gate_t.clone(),
+        up: up_t.clone(),
+    };
+    Ok(Some(xs.apply_op1_no_bwd(&op)?))
+}
+
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {

@@ -366,6 +366,75 @@ fn mul_mat_vec_via_q8_1(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// Fused SwiGLU matvec: `silu(gate·y) * (up·y)` with the activation
+/// quantized to q8_1 once for both weight matrices, SiLU and the product
+/// applied in the kernel epilogue (`mul_mat_vec_q4_K_q8_1_glu_cuda*`).
+/// Q4K-only by design — callers must check dtype and fall back to the
+/// unfused path otherwise.
+#[allow(clippy::too_many_arguments)]
+fn mul_mat_vec_glu_via_q8_1(
+    gate: &PaddedCudaSlice,
+    up: &PaddedCudaSlice,
+    y: &CudaSlice<f32>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    b_size: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    use cudarc::driver::LaunchAsync;
+
+    if dtype != GgmlDType::Q4K {
+        crate::bail!("fused glu matvec only supports q4_K, got {dtype:?}")
+    }
+    for (name, data) in [("gate", gate), ("up", up)] {
+        let data_elems = data.len / dtype.type_size() * dtype.block_size();
+        if data_elems < ncols * nrows {
+            crate::bail!("unexpected {name} size {}, ncols {ncols} {nrows}", data_elems)
+        }
+    }
+    if y.len() != ncols * b_size {
+        crate::bail!("unexpected y size {}, ncols {ncols} b_size {b_size}", y.len())
+    }
+    if b_size == 0 || b_size > 8 {
+        crate::bail!("only bsize between 1 and 8 are supported, got {b_size}")
+    }
+    // Quantize y once, shared by both matvecs.
+    let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+    let y_size_in_bytes =
+        b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes).w()? };
+    quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
+
+    let kernel_name = format!("mul_mat_vec_q4_K_q8_1_glu_cuda{b_size}");
+    let func = dev.get_or_load_func(&kernel_name, candle_kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
+    let (nblocks, nwarps) = match b_size {
+        1 => (nrows as u32, 4),
+        2..=4 => ((nrows as u32 + 1) / 2, 4),
+        5..=8 => ((nrows as u32 + 1) / 2, 2),
+        _ => crate::bail!("unexpected bsize {b_size}"),
+    };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nblocks, 1, 1),
+        block_dim: (WARP_SIZE as u32, nwarps, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let params = (
+        &gate.inner,
+        &up.inner,
+        &y_q8_1,
+        &dst,
+        /* ncols_x */ ncols as i32,
+        /* nrows_x */ nrows as i32,
+        /* nrows_y */ ncols_padded as i32,
+        /* nrows_dst */ nrows as i32,
+    );
+    unsafe { func.launch(cfg, params) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mul_mat_via_q8_1(
     data: &PaddedCudaSlice,
@@ -681,6 +750,52 @@ impl QCudaStorage {
         } else {
             self.dequantize_matmul(self_shape, storage, layout)
         }
+    }
+
+    /// Fused SwiGLU forward over two same-shape Q4K weights (`self` = gate,
+    /// `up`): `silu(gate·y) * (up·y)`, activation quantized once. Callers
+    /// (see `quantized::fused_swiglu_forward`) are responsible for
+    /// eligibility checks (dtype Q4K, decode-width batch, contiguous rhs);
+    /// this errors rather than falling back.
+    pub fn fwd_glu(
+        &self,
+        up: &QCudaStorage,
+        self_shape: &crate::Shape,
+        rhs: &CudaStorage,
+        rhs_l: &crate::Layout,
+    ) -> Result<(CudaStorage, crate::Shape)> {
+        let (nrows, ncols) = self_shape.dims2()?;
+        let rhs = rhs.as_cuda_slice::<f32>()?;
+        match rhs_l.contiguous_offsets() {
+            Some((o1, _)) => {
+                if o1 != 0 {
+                    crate::bail!("sliced input is not supported in fused glu matmul")
+                }
+            }
+            None => Err(crate::Error::RequiresContiguous { op: "qglu-matmul" }.bt())?,
+        };
+        let (b_size, k) = match rhs_l.shape().dims() {
+            [b, m, k] => (b * m, *k),
+            [b, k] => (*b, *k),
+            _ => crate::bail!("unexpected rhs shape in fused glu {:?}", rhs_l.shape()),
+        };
+        if ncols != k {
+            crate::bail!("mismatch on glu matmul dim {self_shape:?} {:?}", rhs_l.shape())
+        }
+        let out = mul_mat_vec_glu_via_q8_1(
+            &self.data,
+            &up.data,
+            &rhs,
+            self.dtype,
+            ncols,
+            nrows,
+            b_size,
+            self.device(),
+        )?;
+        let mut out_shape = rhs_l.shape().dims().to_vec();
+        out_shape.pop();
+        out_shape.push(nrows);
+        Ok((out, out_shape.into()))
     }
 }
 
