@@ -582,7 +582,7 @@ fn mul_mat_via_q8_1(
 
     let params = (
         /* vx */ &data.inner,
-        /* vy */ &y_q8_1,
+        /* vy */ y_q8_1,
         /* dst */ &dst,
         /* ncols_x */ x_cols as i32,
         /* nrows_x */ x_rows as i32,
