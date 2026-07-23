@@ -25,12 +25,14 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `MOSS_CANDLE_MMVQ_PREFETCH=1` opts q4_K matvecs into the
-/// software-pipelined `..._pf_cuda*` kernels (moss rtf Phase C1) — kept
-/// opt-in so same-binary A/Bs never need a rebuild.
+/// Software-pipelined `..._pf_cuda*` q4_K matvecs (moss rtf Phase C1) are
+/// ON by default after the shipped A/B (RTX 3090 350 W, same binary:
+/// −5.1% wall at 8 concurrent sequences, neutral at 4; bit-exact
+/// checksums and fused-GLU equivalence green).
+/// `MOSS_CANDLE_MMVQ_PREFETCH=0` restores the standard kernels for A/Bs.
 fn mmvq_prefetch_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MOSS_CANDLE_MMVQ_PREFETCH").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("MOSS_CANDLE_MMVQ_PREFETCH").is_ok_and(|v| v == "0"))
 }
 
 pub const WARP_SIZE: usize = 32;
