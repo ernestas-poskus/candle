@@ -2632,7 +2632,14 @@ static __device__ void mul_mat_vec_q(
     constexpr int nwarps              = 1;
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int nwarps              = ncols_y <= 4 ? 4 : 2;
+    // Was `ncols_y <= 4 ? 4 : 2` (llama.cpp's GENERIC table). Measured on
+    // RTX 3090 (moss rtf phase A, 2026-07-23): the warp drop at ncols>=5
+    // cost ~20% of achieved DRAM bandwidth on the decode matvecs
+    // (~850 GB/s at ncols=4/nwarps=4 vs ~670 GB/s at ncols=5/nwarps=2,
+    // 28 MB gate/up weights), producing a batch-scaling cliff at 5 slots.
+    // 4 warps keeps memory-level parallelism up through ncols 8; shared
+    // reduction storage stays small (<= 6 KB at ncols 8).
+    constexpr int nwarps              = 4;
     constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
@@ -3359,7 +3366,14 @@ static __device__ void mul_mat_vec_q_glu(
     const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
 
-    constexpr int nwarps              = ncols_y <= 4 ? 4 : 2;
+    // Was `ncols_y <= 4 ? 4 : 2` (llama.cpp's GENERIC table). Measured on
+    // RTX 3090 (moss rtf phase A, 2026-07-23): the warp drop at ncols>=5
+    // cost ~20% of achieved DRAM bandwidth on the decode matvecs
+    // (~850 GB/s at ncols=4/nwarps=4 vs ~670 GB/s at ncols=5/nwarps=2,
+    // 28 MB gate/up weights), producing a batch-scaling cliff at 5 slots.
+    // 4 warps keeps memory-level parallelism up through ncols 8; shared
+    // reduction storage stays small (<= 6 KB at ncols 8).
+    constexpr int nwarps              = 4;
     constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
