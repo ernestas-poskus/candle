@@ -8,6 +8,10 @@ pub struct QCudaStorage {
 }
 
 impl QCudaStorage {
+    pub fn host_data(&self) -> Result<Vec<u8>> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn zeros(_: &CudaDevice, _: usize, _: GgmlDType) -> Result<Self> {
         Err(Error::NotCompiledWithCudaSupport)
     }

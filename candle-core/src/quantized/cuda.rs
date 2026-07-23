@@ -696,6 +696,14 @@ impl QCudaStorage {
         &self.device
     }
 
+    /// Raw quantized bytes copied back to the host (unpadded length) —
+    /// load-time helper for [`crate::quantized::QTensor::concat_rows`].
+    pub fn host_data(&self) -> Result<Vec<u8>> {
+        self.device
+            .dtoh_sync_copy(&self.data.inner.slice(..self.data.len))
+            .w()
+    }
+
     pub fn device_ptr(&self) -> Result<*const u8> {
         use cudarc::driver::DevicePtr;
         Ok(*self.data.inner.device_ptr() as *const u8)

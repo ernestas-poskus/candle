@@ -123,7 +123,8 @@ impl QStorage {
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
                 Ok(Cow::from(data))
             }
-            QStorage::Metal(_) | QStorage::Cuda(_) => {
+            QStorage::Cuda(storage) => Ok(Cow::from(storage.host_data()?)),
+            QStorage::Metal(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -390,6 +391,42 @@ impl QTensor {
             }
             Device::Metal(_) => false,
         }
+    }
+
+    /// Concatenates rank-2 quantized tensors along dim 0 (rows) WITHOUT
+    /// dequantizing: row-major block-quantized layouts make the fused
+    /// weight's bytes exactly the inputs' bytes appended. Built for fusing
+    /// attention q/k/v projections into one matvec launch (MOSS C5); the
+    /// device round-trip is load-time-only.
+    pub fn concat_rows(ts: &[&Self], device: &Device) -> Result<Self> {
+        let first = match ts.first() {
+            Some(t) => t,
+            None => crate::bail!("concat_rows: empty input"),
+        };
+        let dtype = first.dtype();
+        let dims = first.shape().dims();
+        if dims.len() != 2 {
+            crate::bail!("concat_rows: expected rank-2 tensors, got {dims:?}");
+        }
+        let cols = dims[1];
+        let mut total_rows = 0usize;
+        let mut bytes: Vec<u8> = Vec::new();
+        for t in ts {
+            let tdims = t.shape().dims();
+            if t.dtype() != dtype {
+                crate::bail!(
+                    "concat_rows: mixed dtypes {:?} vs {:?}",
+                    t.dtype(),
+                    dtype
+                );
+            }
+            if tdims.len() != 2 || tdims[1] != cols {
+                crate::bail!("concat_rows: incompatible shape {tdims:?}, want [_, {cols}]");
+            }
+            total_rows += tdims[0];
+            bytes.extend_from_slice(&t.data()?);
+        }
+        ggml_file::qtensor_from_ggml(dtype, &bytes, vec![total_rows, cols], device)
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
