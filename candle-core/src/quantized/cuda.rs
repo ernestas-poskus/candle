@@ -35,6 +35,45 @@ fn mmvq_prefetch_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("MOSS_CANDLE_MMVQ_PREFETCH").is_ok_and(|v| v == "0"))
 }
 
+/// Grow-only per-device scratch for the activation-quantization buffer
+/// (moss rtf Phase C3): the decode hot loop re-allocated `y_q8_1` on every
+/// quantized matvec (~250 `cuMemAllocAsync`/`cuMemFreeAsync` pairs per
+/// step at 5 slots). Reuse is stream-ordered-safe — each device runs a
+/// single compute stream, so the previous kernel that read the buffer is
+/// ordered before the next `quantize_q8_1` that overwrites it. While a
+/// CUDA graph capture is active the scratch is bypassed: an allocation
+/// captured into a graph becomes graph-owned memory that must not be
+/// shared with eager calls. `MOSS_CANDLE_Q8_SCRATCH=0` disables for A/Bs.
+fn q8_1_scratch(
+    dev: &CudaDevice,
+    need_bytes: usize,
+) -> Result<Option<std::sync::Arc<CudaSlice<u8>>>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| !std::env::var("MOSS_CANDLE_Q8_SCRATCH").is_ok_and(|v| v == "0"))
+    {
+        return Ok(None);
+    }
+    let capturing = cudarc::driver::capture_status(*dev.cu_stream())
+        == Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE);
+    if capturing {
+        return Ok(None);
+    }
+    static REG: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u8>>>>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut reg = reg.lock().unwrap();
+    let key = dev.cuda_device().ordinal();
+    if let Some(s) = reg.get(&key) {
+        if s.len() >= need_bytes {
+            return Ok(Some(s.clone()));
+        }
+    }
+    let s = Arc::new(unsafe { dev.alloc::<u8>(need_bytes.next_power_of_two()).w()? });
+    reg.insert(key, s.clone());
+    Ok(Some(s))
+}
+
 pub const WARP_SIZE: usize = 32;
 pub const MMQ_X_Q4_0_AMPERE: usize = 4;
 pub const MMQ_Y_Q4_0_AMPERE: usize = 32;
@@ -89,7 +128,7 @@ fn quantize_q8_0(
 
 fn quantize_q8_1(
     src: &CudaSlice<f32>,
-    dst: &mut CudaSlice<u8>,
+    dst: &CudaSlice<u8>,
     k: usize,
     ky: usize,
     dev: &CudaDevice,
@@ -331,8 +370,16 @@ fn mul_mat_vec_via_q8_1(
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes).w()? };
-    quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
+    let y_scratch = q8_1_scratch(dev, y_size_in_bytes)?;
+    let y_q8_1_owned;
+    let y_q8_1: &CudaSlice<u8> = match &y_scratch {
+        Some(s) => s,
+        None => {
+            y_q8_1_owned = unsafe { dev.alloc::<u8>(y_size_in_bytes).w()? };
+            &y_q8_1_owned
+        }
+    };
+    quantize_q8_1(y, y_q8_1, ncols, b_size, dev)?;
 
     let kernel_name = match dtype {
         GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_cuda",
@@ -375,7 +422,7 @@ fn mul_mat_vec_via_q8_1(
 
     let params = (
         &data.inner,
-        &y_q8_1,
+        y_q8_1,
         &dst,
         /* ncols_x */ ncols as i32,
         /* nrows_x */ nrows as i32,
@@ -423,8 +470,16 @@ fn mul_mat_vec_glu_via_q8_1(
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes).w()? };
-    quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
+    let y_scratch = q8_1_scratch(dev, y_size_in_bytes)?;
+    let y_q8_1_owned;
+    let y_q8_1: &CudaSlice<u8> = match &y_scratch {
+        Some(s) => s,
+        None => {
+            y_q8_1_owned = unsafe { dev.alloc::<u8>(y_size_in_bytes).w()? };
+            &y_q8_1_owned
+        }
+    };
+    quantize_q8_1(y, y_q8_1, ncols, b_size, dev)?;
 
     // GLU chains are 2x longer per iteration (gate + up computes), so the
     // prefetch variant applies at every batch width when enabled.
@@ -450,7 +505,7 @@ fn mul_mat_vec_glu_via_q8_1(
     let params = (
         &gate.inner,
         &up.inner,
-        &y_q8_1,
+        y_q8_1,
         &dst,
         /* ncols_x */ ncols as i32,
         /* nrows_x */ nrows as i32,
@@ -489,8 +544,16 @@ fn mul_mat_via_q8_1(
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         k_padded * y_cols * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes).w()? };
-    quantize_q8_1(y, &mut y_q8_1, k, y_cols, dev)?;
+    let y_scratch = q8_1_scratch(dev, y_size_in_bytes)?;
+    let y_q8_1_owned;
+    let y_q8_1: &CudaSlice<u8> = match &y_scratch {
+        Some(s) => s,
+        None => {
+            y_q8_1_owned = unsafe { dev.alloc::<u8>(y_size_in_bytes).w()? };
+            &y_q8_1_owned
+        }
+    };
+    quantize_q8_1(y, y_q8_1, k, y_cols, dev)?;
 
     let (kernel_name, mmq_x, mmq_y) = match dtype {
         GgmlDType::Q4_0 => ("mul_mat_q4_0", 64, 128),
