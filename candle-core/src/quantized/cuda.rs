@@ -344,7 +344,7 @@ fn mul_mat_vec_via_q8_1(
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32 + 1) / 2, 4),
-        5..=8 => ((nrows as u32 + 1) / 2, 2),
+        5..=8 => ((nrows as u32 + 1) / 2, 4),
         _ => crate::bail!("unexpected bsize {b_size}"),
     };
     let cfg = cudarc::driver::LaunchConfig {
@@ -412,7 +412,7 @@ fn mul_mat_vec_glu_via_q8_1(
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32 + 1) / 2, 4),
-        5..=8 => ((nrows as u32 + 1) / 2, 2),
+        5..=8 => ((nrows as u32 + 1) / 2, 4),
         _ => crate::bail!("unexpected bsize {b_size}"),
     };
     let cfg = cudarc::driver::LaunchConfig {
@@ -830,7 +830,7 @@ fn mul_mat_vec_via_q8_1_with_out(
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32 + 1) / 2, 4),
-        5..=8 => ((nrows as u32 + 1) / 2, 2),
+        5..=8 => ((nrows as u32 + 1) / 2, 4),
         _ => crate::bail!("unexpected bsize {b_size}"),
     };
     let cfg = cudarc::driver::LaunchConfig {
