@@ -3614,6 +3614,137 @@ static __device__ void mul_mat_vec_q4K_pf(
     }
 }
 
+// Fused-SwiGLU sibling with the same one-iteration-ahead x-side pipeline:
+// gate and up fragments are both prefetched, the shared y blocks load
+// in-iteration. Measured basis: the GLU kernels are the largest q4_K
+// launches (2x weights per launch), so the latency-hiding win surface is
+// biggest here; the plain pf variant measured -8.6%/launch at ncols=8.
+template <int ncols_y>
+static __device__ void mul_mat_vec_q4K_glu_pf(
+    const void * __restrict__ vgate, const void * __restrict__ vup,
+    const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    constexpr int qk  = QK_K;
+    constexpr int qi  = QI4_K;
+    constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    constexpr int nwarps              = 4;
+    constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
+
+    const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int blocks_per_row_x = ncols_x / qk;
+    const     int blocks_per_col_y = nrows_y / QK8_1;
+    constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
+
+    float tmp_g[ncols_y][rows_per_cuda_block] = {0.0f};
+    float tmp_u[ncols_y][rows_per_cuda_block] = {0.0f};
+
+    const block_q4_K * xg = (const block_q4_K *) vgate;
+    const block_q4_K * xu = (const block_q4_K *) vup;
+    const block_q8_1 * y  = (const block_q8_1 *) vy;
+
+    int kbx = tid / (qi/vdr);
+    const int kqs = vdr * (tid % (qi/vdr));
+
+    q4K_xfrag cur_g[rows_per_cuda_block], nxt_g[rows_per_cuda_block];
+    q4K_xfrag cur_u[rows_per_cuda_block], nxt_u[rows_per_cuda_block];
+
+    bool valid = kbx < blocks_per_row_x;
+    if (valid) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            q4K_xload(&xg[kbx + (row0 + i)*blocks_per_row_x], kqs, &cur_g[i]);
+            q4K_xload(&xu[kbx + (row0 + i)*blocks_per_row_x], kqs, &cur_u[i]);
+        }
+    }
+    while (valid) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kbx_next = kbx + blocks_per_iter;
+        const bool valid_next = kbx_next < blocks_per_row_x;
+        if (valid_next) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                q4K_xload(&xg[kbx_next + (row0 + i)*blocks_per_row_x], kqs, &nxt_g[i]);
+                q4K_xload(&xu[kbx_next + (row0 + i)*blocks_per_row_x], kqs, &nxt_u[i]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp_g[j][i] += q4K_compute(cur_g[i], &y[j*blocks_per_col_y + kby], kqs);
+                tmp_u[j][i] += q4K_compute(cur_u[i], &y[j*blocks_per_col_y + kby], kqs);
+            }
+        }
+        if (valid_next) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                cur_g[i] = nxt_g[i];
+                cur_u[i] = nxt_u[i];
+            }
+        }
+        kbx = kbx_next;
+        valid = valid_next;
+    }
+
+    __shared__ float smem_g[nwarps-1 > 0 ? nwarps-1 : 1][ncols_y][rows_per_cuda_block][WARP_SIZE];
+    __shared__ float smem_u[nwarps-1 > 0 ? nwarps-1 : 1][ncols_y][rows_per_cuda_block][WARP_SIZE];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                smem_g[threadIdx.y-1][j][i][threadIdx.x] = tmp_g[j][i];
+                smem_u[threadIdx.y-1][j][i][threadIdx.x] = tmp_u[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp_g[j][i] += smem_g[l][j][i][threadIdx.x];
+                tmp_u[j][i] += smem_u[l][j][i][threadIdx.x];
+            }
+            tmp_g[j][i] = warp_reduce_sum(tmp_g[j][i]);
+            tmp_u[j][i] = warp_reduce_sum(tmp_u[j][i]);
+        }
+
+        if (threadIdx.x < rows_per_cuda_block) {
+            const float g = tmp_g[j][threadIdx.x];
+            const float u = tmp_u[j][threadIdx.x];
+            const float silu_g = g / (1.0f + __expf(-g));
+            dst[j*nrows_dst + row0 + threadIdx.x] = silu_g * u;
+        }
+    }
+}
+
+#define MMVQ_GLU_PF_Q4K_ENTRY(N) \
+extern "C" __global__ void mul_mat_vec_q4_K_q8_1_glu_pf_cuda##N( \
+    const void * vgate, const void * vup, const void * vy, float * dst, \
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) { \
+    mul_mat_vec_q4K_glu_pf<N>(vgate, vup, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); \
+}
+
+MMVQ_GLU_PF_Q4K_ENTRY(1)
+MMVQ_GLU_PF_Q4K_ENTRY(2)
+MMVQ_GLU_PF_Q4K_ENTRY(3)
+MMVQ_GLU_PF_Q4K_ENTRY(4)
+MMVQ_GLU_PF_Q4K_ENTRY(5)
+MMVQ_GLU_PF_Q4K_ENTRY(6)
+MMVQ_GLU_PF_Q4K_ENTRY(7)
+MMVQ_GLU_PF_Q4K_ENTRY(8)
+
+#undef MMVQ_GLU_PF_Q4K_ENTRY
+
 #define MMVQ_PF_Q4K_ENTRY(N) \
 extern "C" __global__ void mul_mat_vec_q4_K_q8_1_pf_cuda##N( \
     const void * vx, const void * vy, float * dst, \

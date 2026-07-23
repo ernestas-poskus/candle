@@ -347,8 +347,11 @@ fn mul_mat_vec_via_q8_1(
     };
     // Phase C1 (moss rtf): software-pipelined q4_K variant — x-side loads
     // register-double-buffered one iteration ahead. Same math, same launch
-    // geometry; opt-in for same-binary A/Bs.
-    let kernel_name = if dtype == GgmlDType::Q4K && mmvq_prefetch_enabled() {
+    // geometry; opt-in for same-binary A/Bs. ncols>=5 only: measured
+    // -8.6%/launch at ncols=8 but +7% at ncols=4 (the win scales with the
+    // per-thread serial chain length; at short chains the extra register
+    // pressure dominates).
+    let kernel_name = if dtype == GgmlDType::Q4K && b_size >= 5 && mmvq_prefetch_enabled() {
         format!("mul_mat_vec_q4_K_q8_1_pf_cuda{b_size}")
     } else {
         format!("{kernel_name}{b_size}")
@@ -421,7 +424,13 @@ fn mul_mat_vec_glu_via_q8_1(
     let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes).w()? };
     quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
 
-    let kernel_name = format!("mul_mat_vec_q4_K_q8_1_glu_cuda{b_size}");
+    // GLU chains are 2x longer per iteration (gate + up computes), so the
+    // prefetch variant applies at every batch width when enabled.
+    let kernel_name = if mmvq_prefetch_enabled() {
+        format!("mul_mat_vec_q4_K_q8_1_glu_pf_cuda{b_size}")
+    } else {
+        format!("mul_mat_vec_q4_K_q8_1_glu_cuda{b_size}")
+    };
     let func = dev.get_or_load_func(&kernel_name, candle_kernels::QUANTIZED)?;
     let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
     let (nblocks, nwarps) = match b_size {
