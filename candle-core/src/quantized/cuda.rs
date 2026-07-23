@@ -738,7 +738,19 @@ impl QCudaStorage {
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
         } else {
-            8
+            // mmvq-vs-mmq crossover. mmvq's per-launch time grows ~linearly
+            // with ncols (per-column serial dot chains), flattening batched
+            // decode throughput past ~4 concurrent sequences (moss rtf
+            // phase A, RTX 3090); the MMQ tile kernels amortize weights
+            // across the whole tile instead. Default stays 8; overridable
+            // for measurement via MOSS_CANDLE_MMVQ_MAX_BM.
+            static MAX_BM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *MAX_BM.get_or_init(|| {
+                std::env::var("MOSS_CANDLE_MMVQ_MAX_BM")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8)
+            })
         };
         let use_vec_kernel = match layout.shape().dims() {
             [b, m, _k] => b * m <= max_bm,
