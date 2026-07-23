@@ -25,6 +25,14 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `MOSS_CANDLE_MMVQ_PREFETCH=1` opts q4_K matvecs into the
+/// software-pipelined `..._pf_cuda*` kernels (moss rtf Phase C1) — kept
+/// opt-in so same-binary A/Bs never need a rebuild.
+fn mmvq_prefetch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MOSS_CANDLE_MMVQ_PREFETCH").is_ok_and(|v| v == "1"))
+}
+
 pub const WARP_SIZE: usize = 32;
 pub const MMQ_X_Q4_0_AMPERE: usize = 4;
 pub const MMQ_Y_Q4_0_AMPERE: usize = 32;
@@ -337,7 +345,14 @@ fn mul_mat_vec_via_q8_1(
         GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
-    let kernel_name = format!("{kernel_name}{b_size}");
+    // Phase C1 (moss rtf): software-pipelined q4_K variant — x-side loads
+    // register-double-buffered one iteration ahead. Same math, same launch
+    // geometry; opt-in for same-binary A/Bs.
+    let kernel_name = if dtype == GgmlDType::Q4K && mmvq_prefetch_enabled() {
+        format!("mul_mat_vec_q4_K_q8_1_pf_cuda{b_size}")
+    } else {
+        format!("{kernel_name}{b_size}")
+    };
     let func = dev.get_or_load_func(&kernel_name, candle_kernels::QUANTIZED)?;
     let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98

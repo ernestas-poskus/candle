@@ -3463,6 +3463,175 @@ MMVQ_GLU_Q4K_ENTRY(8)
 
 #undef MMVQ_GLU_Q4K_ENTRY
 
+// ===== Software-pipelined q4_K matvec (moss rtf Phase C1-V1) =====
+// Same math as mul_mat_vec_q<..., vec_dot_q4_K_q8_1>, but the x-side
+// (weight) loads for iteration i+1 are issued into registers BEFORE
+// iteration i's dp4a chain consumes its values, breaking the
+// load->compute serial dependency. Measured context (RTX 3090, blind
+// protocol — RunPod locks ncu counters): the standard kernels reach only
+// ~45% of DRAM peak with per-column time flat in ncols, i.e.
+// latency-bound on the serial per-iteration chain, which is exactly what
+// register double-buffering targets. y-side loads stay in-iteration (the
+// activation is a few KB and L2-resident). nwarps is fixed at 4 to match
+// the host launch tables. Dispatched behind MOSS_CANDLE_MMVQ_PREFETCH=1.
+struct q4K_xfrag {
+    int v0;
+    int v1;
+    uint16_t aux0;
+    uint16_t aux1;
+    half2 dm;
+};
+
+static __device__ __forceinline__ void q4K_xload(
+    const block_q4_K * __restrict__ b, const int iqs, q4K_xfrag * f) {
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int * q4 = (const int *)(b->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    f->v0 = q4[0];
+    f->v1 = q4[4];
+    const uint16_t * scales = (const uint16_t *)b->scales;
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        f->aux0 = scales[j+0] & 0x3f3f;
+        f->aux1 = scales[j+2] & 0x3f3f;
+    } else {
+        f->aux0 = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        f->aux1 = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    f->dm = b->dm;
+}
+
+static __device__ __forceinline__ float q4K_compute(
+    const q4K_xfrag & f, const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+    int v[2] = { f.v0, f.v1 };
+    int u[2*QR4_K];
+    float d8[QR4_K];
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    uint16_t aux[2] = { f.aux0, f.aux1 };
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, f.dm, d8);
+}
+
+template <int ncols_y>
+static __device__ void mul_mat_vec_q4K_pf(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    constexpr int qk  = QK_K;
+    constexpr int qi  = QI4_K;
+    constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+    constexpr int nwarps              = 4;
+    constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
+
+    const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int blocks_per_row_x = ncols_x / qk;
+    const     int blocks_per_col_y = nrows_y / QK8_1;
+    constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
+
+    float tmp[ncols_y][rows_per_cuda_block] = {0.0f};
+
+    const block_q4_K * x = (const block_q4_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    int kbx = tid / (qi/vdr);
+    const int kqs = vdr * (tid % (qi/vdr));
+
+    q4K_xfrag cur[rows_per_cuda_block];
+    q4K_xfrag nxt[rows_per_cuda_block];
+
+    bool valid = kbx < blocks_per_row_x;
+    if (valid) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            q4K_xload(&x[kbx + (row0 + i)*blocks_per_row_x], kqs, &cur[i]);
+        }
+    }
+    while (valid) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kbx_next = kbx + blocks_per_iter;
+        const bool valid_next = kbx_next < blocks_per_row_x;
+        if (valid_next) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                q4K_xload(&x[kbx_next + (row0 + i)*blocks_per_row_x], kqs, &nxt[i]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp[j][i] += q4K_compute(cur[i], &y[j*blocks_per_col_y + kby], kqs);
+            }
+        }
+        if (valid_next) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                cur[i] = nxt[i];
+            }
+        }
+        kbx = kbx_next;
+        valid = valid_next;
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_y][rows_per_cuda_block][WARP_SIZE];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+            }
+            tmp[j][i] = warp_reduce_sum(tmp[j][i]);
+        }
+
+        if (threadIdx.x < rows_per_cuda_block) {
+            dst[j*nrows_dst + row0 + threadIdx.x] = tmp[j][threadIdx.x];
+        }
+    }
+}
+
+#define MMVQ_PF_Q4K_ENTRY(N) \
+extern "C" __global__ void mul_mat_vec_q4_K_q8_1_pf_cuda##N( \
+    const void * vx, const void * vy, float * dst, \
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) { \
+    mul_mat_vec_q4K_pf<N>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); \
+}
+
+MMVQ_PF_Q4K_ENTRY(1)
+MMVQ_PF_Q4K_ENTRY(2)
+MMVQ_PF_Q4K_ENTRY(3)
+MMVQ_PF_Q4K_ENTRY(4)
+MMVQ_PF_Q4K_ENTRY(5)
+MMVQ_PF_Q4K_ENTRY(6)
+MMVQ_PF_Q4K_ENTRY(7)
+MMVQ_PF_Q4K_ENTRY(8)
+
+#undef MMVQ_PF_Q4K_ENTRY
+
 extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
     const int ix = blockDim.x*blockIdx.x + threadIdx.x;
 
