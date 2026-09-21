@@ -3345,6 +3345,110 @@ extern "C" __global__ void mul_mat_vec_q6_K_q8_1_cuda8(
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
+// Fused SwiGLU matvec: dst = silu(gate·y) * (up·y), both weight matrices
+// walked in lockstep over one shared quantized-activation buffer, SiLU and
+// the elementwise product applied in the epilogue. Same launch geometry and
+// tuning parameters as mul_mat_vec_q (which is at parity with upstream
+// llama.cpp's mmvq for these shapes; llama.cpp ships the same fusion as
+// mmvq's `has_fusion` path). Replaces, per FFN call: one activation
+// quantization, one kernel launch, the separate SiLU and mul kernels, and
+// one intermediate-activation round trip.
+template <int ncols_y, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+static __device__ void mul_mat_vec_q_glu(
+    const void * __restrict__ vgate, const void * __restrict__ vup,
+    const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    constexpr int nwarps              = ncols_y <= 4 ? 4 : 2;
+    constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
+
+    const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int blocks_per_row_x = ncols_x / qk;
+    const     int blocks_per_col_y = nrows_y / QK8_1;
+    constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
+
+    float tmp_g[ncols_y][rows_per_cuda_block] = {0.0f};
+    float tmp_u[ncols_y][rows_per_cuda_block] = {0.0f};
+
+    const block_q_t  * xg = (const block_q_t  *) vgate;
+    const block_q_t  * xu = (const block_q_t  *) vup;
+    const block_q8_1 * y  = (const block_q8_1 *) vy;
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+        const int kqs = vdr * (tid % (qi/vdr));
+
+#pragma unroll
+        for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp_g[j][i] += vec_dot_q_cuda(
+                    &xg[kbx + (row0 + i)*blocks_per_row_x], &y[j*blocks_per_col_y + kby], kqs);
+                tmp_u[j][i] += vec_dot_q_cuda(
+                    &xu[kbx + (row0 + i)*blocks_per_row_x], &y[j*blocks_per_col_y + kby], kqs);
+            }
+        }
+    }
+
+    __shared__ float smem_g[nwarps-1 > 0 ? nwarps-1 : 1][ncols_y][rows_per_cuda_block][WARP_SIZE];
+    __shared__ float smem_u[nwarps-1 > 0 ? nwarps-1 : 1][ncols_y][rows_per_cuda_block][WARP_SIZE];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                smem_g[threadIdx.y-1][j][i][threadIdx.x] = tmp_g[j][i];
+                smem_u[threadIdx.y-1][j][i][threadIdx.x] = tmp_u[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp_g[j][i] += smem_g[l][j][i][threadIdx.x];
+                tmp_u[j][i] += smem_u[l][j][i][threadIdx.x];
+            }
+            tmp_g[j][i] = warp_reduce_sum(tmp_g[j][i]);
+            tmp_u[j][i] = warp_reduce_sum(tmp_u[j][i]);
+        }
+
+        if (threadIdx.x < rows_per_cuda_block) {
+            const float g = tmp_g[j][threadIdx.x];
+            const float u = tmp_u[j][threadIdx.x];
+            const float silu_g = g / (1.0f + __expf(-g));
+            dst[j*nrows_dst + row0 + threadIdx.x] = silu_g * u;
+        }
+    }
+}
+
+#define MMVQ_GLU_Q4K_ENTRY(N) \
+extern "C" __global__ void mul_mat_vec_q4_K_q8_1_glu_cuda##N( \
+    const void * vgate, const void * vup, const void * vy, float * dst, \
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) { \
+    mul_mat_vec_q_glu<N, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1> \
+        (vgate, vup, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); \
+}
+
+MMVQ_GLU_Q4K_ENTRY(1)
+MMVQ_GLU_Q4K_ENTRY(2)
+MMVQ_GLU_Q4K_ENTRY(3)
+MMVQ_GLU_Q4K_ENTRY(4)
+MMVQ_GLU_Q4K_ENTRY(5)
+MMVQ_GLU_Q4K_ENTRY(6)
+MMVQ_GLU_Q4K_ENTRY(7)
+MMVQ_GLU_Q4K_ENTRY(8)
+
+#undef MMVQ_GLU_Q4K_ENTRY
+
 extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
     const int ix = blockDim.x*blockIdx.x + threadIdx.x;
 
