@@ -364,7 +364,7 @@ fn mul_mat_vec_via_q8_1(
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32 + 1) / 2, 4),
-        5..=8 => ((nrows as u32 + 1) / 2, 2),
+        5..=8 => ((nrows as u32 + 1) / 2, 4),
         _ => crate::bail!("unexpected bsize {b_size}"),
     };
     let cfg = cudarc::driver::LaunchConfig {
@@ -432,7 +432,7 @@ fn mul_mat_vec_glu_via_q8_1(
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32 + 1) / 2, 4),
-        5..=8 => ((nrows as u32 + 1) / 2, 2),
+        5..=8 => ((nrows as u32 + 1) / 2, 4),
         _ => crate::bail!("unexpected bsize {b_size}"),
     };
     let cfg = cudarc::driver::LaunchConfig {
@@ -782,7 +782,19 @@ impl QCudaStorage {
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
         } else {
-            8
+            // mmvq-vs-mmq crossover. mmvq's per-launch time grows ~linearly
+            // with ncols (per-column serial dot chains), flattening batched
+            // decode throughput past ~4 concurrent sequences (measured
+            // on RTX 3090); the MMQ tile kernels amortize weights
+            // across the whole tile instead. Default stays 8; overridable
+            // for measurement via CANDLE_MMVQ_MAX_BM.
+            static MAX_BM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *MAX_BM.get_or_init(|| {
+                std::env::var("CANDLE_MMVQ_MAX_BM")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8)
+            })
         };
         let use_vec_kernel = match layout.shape().dims() {
             [b, m, _k] => b * m <= max_bm,
@@ -874,7 +886,7 @@ fn mul_mat_vec_via_q8_1_with_out(
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32 + 1) / 2, 4),
-        5..=8 => ((nrows as u32 + 1) / 2, 2),
+        5..=8 => ((nrows as u32 + 1) / 2, 4),
         _ => crate::bail!("unexpected bsize {b_size}"),
     };
     let cfg = cudarc::driver::LaunchConfig {
