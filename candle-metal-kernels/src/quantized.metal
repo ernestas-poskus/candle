@@ -7009,6 +7009,29 @@ kernel void kernel_get_rows_i32(
 #define SG_MAT_SIZE 64 // simdgroup matrix is of shape 8x8
 #define SG_MAT_ROW 8
 
+// B-tile precision for kernel_mul_mm. Quantized (and f16) matmuls use half
+// operands, matching llama.cpp's mul_mm; bf16 keeps the float operand it has
+// always used.
+template<typename T> struct mul_mm_b {
+    using B = float;
+    using B2x4 = float2x4;
+    using SG = simdgroup_float8x8;
+    static inline B2x4 load(device const float * y) { return *((device float2x4 *) y); }
+};
+template<> struct mul_mm_b<half> {
+    using B = half;
+    using B2x4 = half2x4;
+    using SG = simdgroup_half8x8;
+    static inline B2x4 load(device const float * y) {
+        float2x4 v = *((device float2x4 *) y);
+        half2x4 r;
+        for (int i = 0; i < 2; i++) {
+            for (int j = 0; j < 4; j++) r[i][j] = half(v[i][j]);
+        }
+        return r;
+    }
+};
+
 // each block_q contains 16*nl weights
 template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_mul_mm(device const  uchar * src0,
@@ -7034,7 +7057,10 @@ kernel void kernel_mul_mm(device const  uchar * src0,
                           uint                  sgitg[[simdgroup_index_in_threadgroup]]) {
 
     threadgroup T     * sa = (threadgroup T     *)(shared_memory);
-    threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
+    // The B tile is kept in the same precision as the dequantized A tile so
+    // the simdgroup multiply runs with half operands, like ggml's mul_mm.
+    threadgroup typename mul_mm_b<T>::B * sb =
+        (threadgroup typename mul_mm_b<T>::B *)(shared_memory + 4096);
 
     const uint r0 = tgpig.y;
     const uint r1 = tgpig.x;
@@ -7049,7 +7075,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
     short thread_col = ((short)tiitg/THREAD_PER_COL) < n_cols ? ((short)tiitg/THREAD_PER_COL) : n_cols - 1;
 
     simdgroup_T8x8     ma[4];
-    simdgroup_float8x8 mb[2];
+    typename mul_mm_b<T>::SG mb[2];
     simdgroup_float8x8 mc[8];
 
     for (short i = 0; i < 8; i++){
@@ -7084,7 +7110,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
             +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
         }
 
-        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = *((device float2x4 *) y);
+        *(threadgroup typename mul_mm_b<T>::B2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = mul_mm_b<T>::load(y);
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + (2+nl-1)/nl : x;
@@ -7094,7 +7120,8 @@ kernel void kernel_mul_mm(device const  uchar * src0,
 
         // load matrices from threadgroup memory and conduct outer products
         threadgroup T     * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
-        threadgroup float * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+        threadgroup typename mul_mm_b<T>::B * lsmb =
+            (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
 
         #pragma unroll(4)
         for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {

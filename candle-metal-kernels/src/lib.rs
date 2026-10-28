@@ -1579,6 +1579,8 @@ pub fn call_sdpa_full(
     alpha: f32,
     softcapping: f32,
     itype: SdpaDType,
+    causal: bool,
+    kv_group: usize,
 ) -> Result<(), MetalKernelError> {
     #[derive(Debug)]
     #[repr(C)]
@@ -1609,6 +1611,8 @@ pub fn call_sdpa_full(
         batch_ndim: i32,
         alpha: f32,
         softcapping: f32,
+        causal: i32,
+        kv_group: i32,
     }
 
     let bk = q_shape.last().unwrap();
@@ -1620,15 +1624,15 @@ pub fn call_sdpa_full(
 
     let name = match (bk, itype) {
         (32, SdpaDType::F16) => "steel_gemm_attention_bm_16_bn_16_bk_32_itype_half",
+        (32, SdpaDType::F32) => "steel_gemm_attention_bm_16_bn_16_bk_32_itype_float",
+        (256, SdpaDType::F16) => "steel_gemm_attention_bm_16_bn_16_bk_256_itype_half",
+        (256, SdpaDType::F32) => "steel_gemm_attention_bm_16_bn_16_bk_256_itype_float",
         (64, SdpaDType::F16) => "steel_gemm_attention_bm_16_bn_16_bk_64_itype_half",
         (96, SdpaDType::F16) => "steel_gemm_attention_bm_16_bn_16_bk_96_itype_half",
         (128, SdpaDType::F16) => "steel_gemm_attention_bm_16_bn_16_bk_128_itype_half",
-        (256, SdpaDType::F16) => "steel_gemm_attention_bm_16_bn_16_bk_256_itype_half",
-        (32, SdpaDType::F32) => "steel_gemm_attention_bm_16_bn_16_bk_32_itype_float",
         (64, SdpaDType::F32) => "steel_gemm_attention_bm_16_bn_16_bk_64_itype_float",
         (96, SdpaDType::F32) => "steel_gemm_attention_bm_16_bn_16_bk_96_itype_float",
         (128, SdpaDType::F32) => "steel_gemm_attention_bm_16_bn_16_bk_128_itype_float",
-        (256, SdpaDType::F32) => "steel_gemm_attention_bm_16_bn_16_bk_256_itype_float",
         (other, SdpaDType::F16 | SdpaDType::F32) => {
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
                 variation: "full",
@@ -1708,6 +1712,8 @@ pub fn call_sdpa_full(
         batch_ndim: batch_ndim as i32,
         alpha,
         softcapping,
+        causal: i32::from(causal),
+        kv_group: kv_group as i32,
     };
     let batch_strides = [b_stride_q, b_stride_k, b_stride_v, b_stride_o];
 

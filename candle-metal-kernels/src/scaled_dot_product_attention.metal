@@ -34,6 +34,8 @@ struct MLXFastAttentionParams {
   const int batch_ndim;
   const float alpha;
   const float softcapping;
+  const int causal;
+  const int kv_group;
 };
 
 struct MLXScaledDotProductAttentionParams {
@@ -1026,7 +1028,10 @@ struct FastAttentionKernel {
       uint simd_lane_id,
       short2 local_blocks,
       float alpha,
-      float softcapping) {
+      float softcapping,
+      bool causal,
+      int query_start,
+      int key_start) {
     if (simd_group_id == 0) {
       short row_offset = BM + float_padding;
       threadgroup float* maxes = Corrections;
@@ -1051,6 +1056,9 @@ struct FastAttentionKernel {
             val = precise::tanh(val);
             val = val * softcapping;
           }
+          if (causal && key_start + j > query_start + int(simd_lane_id)) {
+            val = -INFINITY;
+          }
           m_ij = max(m_ij, val);
         }
 
@@ -1063,6 +1071,9 @@ struct FastAttentionKernel {
           if (softcapping != 1.) {
             val = precise::tanh(val);
             val = val * softcapping;
+          }
+          if (causal && key_start + j > query_start + int(simd_lane_id)) {
+            val = -INFINITY;
           }
           float P_i_j = exp(val - m_ij);
           rowsum += P_i_j;
@@ -1131,7 +1142,8 @@ struct FastAttentionKernel {
     thread loader_k_t loader_k(K, params->ldk, Ks, simd_group_id, simd_lane_id);
     thread loader_v_t loader_v(V, params->ldv, Vs, simd_group_id, simd_lane_id);
 
-    for (short n_block = 0; n_block < params->gemm_n_iterations_aligned;
+    for (short n_block = 0; n_block < params->gemm_n_iterations_aligned &&
+                            (!params->causal || n_block * BN < c_row + BM);
          n_block++) {
       short c_col = BN;
 
@@ -1196,7 +1208,10 @@ struct FastAttentionKernel {
           simd_lane_id,
           short2(tgp_bn_qk, tgp_bm),
           params->alpha,
-          params->softcapping);
+          params->softcapping,
+          params->causal != 0,
+          c_row,
+          n_block * BN);
 
       loader_v.load_safe(short2(BK, tgp_bn_qk));
 
@@ -1275,8 +1290,8 @@ template <
 
   } else {
     Q += params->batch_stride_q * tid.z;
-    K += params->batch_stride_k * tid.z;
-    V += params->batch_stride_v * tid.z;
+    K += params->batch_stride_k * (tid.z / params->kv_group);
+    V += params->batch_stride_v * (tid.z / params->kv_group);
   }
 
   // same shape as input

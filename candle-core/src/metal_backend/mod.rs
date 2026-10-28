@@ -1722,10 +1722,14 @@ impl MetalStorage {
         let command_buffer = device.command_encoder()?;
         let lhs = buffer_o(&self.buffer, lhs_l, self.dtype);
         let rhs = buffer_o(&rhs.buffer, rhs_l, rhs.dtype);
-        let (buffer, dtype) = if lhs_l.is_contiguous() && rhs_l.is_contiguous() && &op[..1] != "b" {
+        // Binary kernel names are always prefixed with "b" (`badd`, `bmul`, ...),
+        // so keying the fast path off that prefix made it unreachable. Pick the
+        // contiguous kernels whenever both layouts are contiguous.
+        let op_contiguous = op.strip_prefix('b').unwrap_or(op);
+        let (buffer, dtype) = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             use candle_metal_kernels::binary::contiguous;
 
-            let (kernel_name, dtype) = match (op, self.dtype) {
+            let (kernel_name, dtype) = match (op_contiguous, self.dtype) {
                 ("add", DType::F32) => (contiguous::add::FLOAT, self.dtype),
                 ("sub", DType::F32) => (contiguous::sub::FLOAT, self.dtype),
                 ("mul", DType::F32) => (contiguous::mul::FLOAT, self.dtype),

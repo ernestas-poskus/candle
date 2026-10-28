@@ -402,7 +402,10 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     device: &MetalDevice,
     data: &[T],
 ) -> Result<QStorage> {
-    let buffer = device.new_buffer_with_data(data)?;
+    // Model weights are read by every token, so keep them in private buffers:
+    // managed buffers stay CPU-visible and are markedly slower to stream on
+    // Apple GPUs. The staging copy is released once the blit completes.
+    let buffer = device.new_private_buffer_with_data(data, "gguf_weight")?;
     let device = device.clone();
     Ok(QStorage::Metal(QMetalStorage {
         dtype: T::DTYPE,

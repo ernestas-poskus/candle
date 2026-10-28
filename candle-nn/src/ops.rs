@@ -973,6 +973,7 @@ impl Module for Identity {
 struct Sdpa {
     scale: f32,
     softcapping: f32,
+    causal: bool,
 }
 
 impl candle::CustomOp3 for Sdpa {
@@ -1037,8 +1038,11 @@ impl candle::CustomOp3 for Sdpa {
 
         const SDPA_FULL_THRESHOLD: usize = 2;
 
-        let supports_sdpa_full =
-            q_seq >= SDPA_FULL_THRESHOLD && supported_head_dim && q_head == k_head;
+        let supports_sdpa_full = q_seq >= SDPA_FULL_THRESHOLD
+            && supported_head_dim
+            && q_head == k_head
+            && (q_l.dim(1)? == k_l.dim(1)? || (self.causal && q_l.dim(0)? == 1))
+            && (!self.causal || (q_l.dim(0)? == 1 && q_seq == k_l.dim(2)?));
         let supports_sdpa_vector = q_seq == 1 && supported_head_dim;
 
         implementation_supports_use_case &= supports_sdpa_full || supports_sdpa_vector;
@@ -1172,6 +1176,8 @@ impl candle::CustomOp3 for Sdpa {
                 self.scale,
                 self.softcapping,
                 itype,
+                self.causal,
+                q_l.dim(1)? / k_l.dim(1)?,
             )
             .map_err(candle::Error::wrap)?;
         } else {
@@ -1209,7 +1215,36 @@ impl candle::CustomOp3 for Sdpa {
 ///     - Requires `seq` == `kv_seq`
 ///     - GQA is not supported (requires `qhead` == `kv_head`)
 pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32, softcapping: f32) -> Result<Tensor> {
-    q.apply_op3_no_bwd(k, v, &Sdpa { scale, softcapping })
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &Sdpa {
+            scale,
+            softcapping,
+            causal: false,
+        },
+    )
+}
+
+/// Causal fused Metal attention for a fresh single-sequence prefill.
+/// Q, K, and V are contiguous [1, heads, sequence, head_dim] tensors; grouped
+/// query heads are supported. The caller keeps the KV cache updated separately.
+pub fn sdpa_causal(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+) -> Result<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &Sdpa {
+            scale,
+            softcapping,
+            causal: true,
+        },
+    )
 }
 
 #[derive(Debug, Clone)]
