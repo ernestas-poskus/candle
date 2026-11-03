@@ -119,6 +119,22 @@ impl Commands {
     }
 }
 
+impl Drop for Commands {
+    /// Metal asserts (`-[_MTLCommandEncoder dealloc]:134: failed assertion
+    /// 'Command encoder released without endEncoding'`) if a compute command
+    /// encoder is released while still open, which aborts the process. The
+    /// encoder here stays open between kernel launches on purpose -- see
+    /// `command_encoder` -- so every path that stops using the device has to
+    /// close it. `wait_until_completed` does that, but nothing guarantees a
+    /// caller reaches it before the last `MetalDevice` clone goes away: a
+    /// program that computes a tensor and then returns drops `Commands` with
+    /// an encoder still open. Closing it here makes the open encoder an
+    /// invariant of the type rather than of the call sequence.
+    fn drop(&mut self) {
+        self.end_current_encoder();
+    }
+}
+
 pub struct CommandEncoderGuard<'a> {
     commands: std::sync::RwLockWriteGuard<'a, Commands>,
 }
