@@ -51,8 +51,7 @@ fn q8_1_scratch(
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| !std::env::var("CANDLE_Q8_SCRATCH").is_ok_and(|v| v == "0"))
-    {
+    if !*ENABLED.get_or_init(|| !std::env::var("CANDLE_Q8_SCRATCH").is_ok_and(|v| v == "0")) {
         return Ok(None);
     }
     let capturing = cudarc::driver::capture_status(*dev.cu_stream())
@@ -428,8 +427,7 @@ fn mul_mat_vec_via_q8_1(
     // the per-thread serial chain length; at short chains the extra register
     // pressure dominates). Disjoint from `use_volta_turing_w2`, which is
     // b_size == 1 only, so the two variant selections cannot both apply.
-    let use_q4k_prefetch =
-        dtype == GgmlDType::Q4K && b_size >= 5 && mmvq_prefetch_enabled();
+    let use_q4k_prefetch = dtype == GgmlDType::Q4K && b_size >= 5 && mmvq_prefetch_enabled();
     let kernel_name = if use_volta_turing_w2 {
         format!("{kernel_name}{b_size}_w2")
     } else if use_q4k_prefetch {
@@ -490,11 +488,17 @@ fn mul_mat_vec_glu_via_q8_1(
     for (name, data) in [("gate", gate), ("up", up)] {
         let data_elems = data.len / dtype.type_size() * dtype.block_size();
         if data_elems < ncols * nrows {
-            crate::bail!("unexpected {name} size {}, ncols {ncols} {nrows}", data_elems)
+            crate::bail!(
+                "unexpected {name} size {}, ncols {ncols} {nrows}",
+                data_elems
+            )
         }
     }
     if y.len() != ncols * b_size {
-        crate::bail!("unexpected y size {}, ncols {ncols} b_size {b_size}", y.len())
+        crate::bail!(
+            "unexpected y size {}, ncols {ncols} b_size {b_size}",
+            y.len()
+        )
     }
     if b_size == 0 || b_size > 8 {
         crate::bail!("only bsize between 1 and 8 are supported, got {b_size}")
@@ -962,7 +966,10 @@ impl QCudaStorage {
             _ => crate::bail!("unexpected rhs shape in fused glu {:?}", rhs_l.shape()),
         };
         if ncols != k {
-            crate::bail!("mismatch on glu matmul dim {self_shape:?} {:?}", rhs_l.shape())
+            crate::bail!(
+                "mismatch on glu matmul dim {self_shape:?} {:?}",
+                rhs_l.shape()
+            )
         }
         let out = mul_mat_vec_glu_via_q8_1(
             &self.data,

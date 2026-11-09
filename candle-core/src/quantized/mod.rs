@@ -496,11 +496,7 @@ impl QTensor {
         for t in ts {
             let tdims = t.shape().dims();
             if t.dtype() != dtype {
-                crate::bail!(
-                    "concat_rows: mixed dtypes {:?} vs {:?}",
-                    t.dtype(),
-                    dtype
-                );
+                crate::bail!("concat_rows: mixed dtypes {:?} vs {:?}", t.dtype(), dtype);
             }
             if tdims.len() != 2 || tdims[1] != cols {
                 crate::bail!("concat_rows: incompatible shape {tdims:?}, want [_, {cols}]");
@@ -915,11 +911,7 @@ impl crate::CustomOp1 for QGluOp {
 /// operands, non-CUDA device, non-Q4K weights, mismatched shapes, or a
 /// batch wider than the mmvq decode kernels support) so callers can fall
 /// back to the unfused ops at zero cost.
-pub fn fused_swiglu_forward(
-    gate: &QMatMul,
-    up: &QMatMul,
-    xs: &Tensor,
-) -> Result<Option<Tensor>> {
+pub fn fused_swiglu_forward(gate: &QMatMul, up: &QMatMul, xs: &Tensor) -> Result<Option<Tensor>> {
     let (gate_t, up_t) = match (gate, up) {
         (QMatMul::QTensor(g), QMatMul::QTensor(u)) => (g, u),
         _ => return Ok(None),
