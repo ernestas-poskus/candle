@@ -770,6 +770,23 @@ impl QMatMul {
         }
     }
 
+    /// Dequantizes the weight to F32 and runs a dense F32 matmul. See
+    /// `Module::forward` for why large-M CUDA batches use this rather than
+    /// [`Self::forward_via_f16`].
+    pub fn forward_via_f32(&self, xs: &Tensor) -> Result<Tensor> {
+        let w = match self {
+            Self::QTensor(t) => t.dequantize(&t.device())?,
+            Self::Tensor(t) | Self::TensorF16(t) => t.to_dtype(DType::F32)?,
+        };
+        let in_dtype = xs.dtype();
+        let w = match *xs.dims() {
+            [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+            [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+            _ => w.t()?,
+        };
+        xs.to_dtype(DType::F32)?.matmul(&w)?.to_dtype(in_dtype)
+    }
+
     pub fn forward_via_f16(&self, xs: &Tensor) -> Result<Tensor> {
         let w = self.dequantize_f16()?;
         let in_dtype = xs.dtype();
@@ -936,19 +953,25 @@ impl crate::Module for QMatMul {
         match self {
             Self::QTensor(t) => {
                 // Packed MMVQ/MMQ is ideal for decode and small batches, but
-                // leaves tensor cores mostly idle for a large prompt.  Match
-                // llama.cpp's CUDA policy: once M is large, dequantize the
-                // weights to F16 and use the vendor tensor-core GEMM.  The
-                // legacy CUDA path quantizes activations to Q8_1 first, so F16
-                // activations do not reduce their numerical precision.
+                // leaves the GPU underused for a large prompt, so once M is
+                // large the weights are dequantized and run through the vendor
+                // GEMM instead.
                 //
-                // Keep this dispatch in candle rather than in a model so all
-                // GGUF tensor types supported by dequantize_f16 benefit.  CPU,
-                // Metal, and the packed small-M path are unchanged.
+                // In F32, not F16: an F16 GEMM writes F16, and real prompts
+                // exceed its 65504 range. Qwen3's layer-6 down projection
+                // reaches ~83k under causal prefill, came back inf, and every
+                // later layer turned NaN. BF16 has the range but rounds every
+                // projection output to 8 bits; measured against Metal, F32 is
+                // the one that matches end to end, at no measurable prefill
+                // cost on an RTX 3090.
+                //
+                // Keep this dispatch in candle rather than in a model so every
+                // GGUF tensor type benefits. CPU, Metal, and the packed
+                // small-M path are unchanged.
                 let k = xs.dims().last().copied().unwrap_or(0);
                 let m = if k == 0 { 0 } else { xs.elem_count() / k };
                 if matches!(t.device(), Device::Cuda(_)) && m >= 64 {
-                    self.forward_via_f16(xs)
+                    self.forward_via_f32(xs)
                 } else {
                     xs.apply_op1_no_bwd(t.as_ref())
                 }

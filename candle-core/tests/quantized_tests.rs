@@ -1185,3 +1185,34 @@ fn quantized_matmul_q8k() -> Result<()> {
     ggml_matmul_error_test::<BlockQ8K>()?;
     Ok(())
 }
+
+/// Large-M CUDA batches are dequantized and run as a dense GEMM. That GEMM
+/// must not be F16: real prompts produce projection outputs past F16's 65504
+/// (Qwen3's down projection reached ~83k under causal prefill), which came
+/// back inf and poisoned every later layer. `forward_via_f32` keeps the range
+/// and matches the quantized kernel.
+#[test]
+fn large_m_dense_path_keeps_f32_range() -> Result<()> {
+    let dev = &Device::Cpu;
+    let (m, k, n) = (64, 256, 8);
+    // Every product is 1.0 * 400.0, so each output is k * 400 = 102400:
+    // representable in F32 and Q8_0, past F16's maximum.
+    let w = Tensor::full(400f32, (n, k), dev)?;
+    let xs = Tensor::ones((m, k), DType::F32, dev)?;
+    let qmm = quantized::QMatMul::from_qtensor(quantized::QTensor::quantize(&w, GgmlDType::Q8_0)?)?;
+
+    let reference = qmm.forward(&xs)?.to_vec2::<f32>()?;
+    let dense = qmm.forward_via_f32(&xs)?.to_vec2::<f32>()?;
+    for (r, d) in reference.iter().flatten().zip(dense.iter().flatten()) {
+        assert!(d.is_finite(), "f32 dense path overflowed: {d}");
+        assert!(
+            (r - d).abs() / r.abs() < 1e-3,
+            "f32 dense {d} vs quantized {r}"
+        );
+    }
+
+    // The F16 path this replaced loses exactly these values.
+    let f16 = qmm.forward_via_f16(&xs)?.to_vec2::<f32>()?;
+    assert!(f16.iter().flatten().all(|v| v.is_infinite()));
+    Ok(())
+}
