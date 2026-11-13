@@ -2622,6 +2622,24 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
+// The epilogue writes row `threadIdx.x` of the per-thread accumulators. Indexing
+// the accumulator array by threadIdx.x directly forces the whole array into
+// local memory (a dynamic index cannot address registers), which on RTX 3090
+// cost 10-47% of the decode matvec time at ncols 4-8 (cold-DRAM bench,
+// candle-kernels/bench/mmvq_bench.cu). Selecting with compile-time indices
+// keeps the accumulators in registers; the result is bit-identical.
+template <int R>
+static __device__ __forceinline__ float mmvq_pick_row(const float (&t)[R]) {
+    float v = t[0];
+#pragma unroll
+    for (int i = 1; i < R; ++i) {
+        if (threadIdx.x == i) {
+            v = t[i];
+        }
+    }
+    return v;
+}
+
 // https://github.com/ggerganov/llama.cpp/blob/c50a82ce0f71558cbb8e555146ba124251504b38/ggml-cuda/mmvq.cu#L4
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs);
 
@@ -2704,7 +2722,7 @@ static __device__ void mul_mat_vec_q(
         }
 
         if (threadIdx.x < rows_per_cuda_block) {
-            dst[j*nrows_dst + row0 + threadIdx.x] = tmp[j][threadIdx.x];
+            dst[j*nrows_dst + row0 + threadIdx.x] = mmvq_pick_row(tmp[j]);
         }
     }
 }
@@ -3461,8 +3479,8 @@ static __device__ void mul_mat_vec_q_glu(
         }
 
         if (threadIdx.x < rows_per_cuda_block) {
-            const float g = tmp_g[j][threadIdx.x];
-            const float u = tmp_u[j][threadIdx.x];
+            const float g = mmvq_pick_row(tmp_g[j]);
+            const float u = mmvq_pick_row(tmp_u[j]);
             const float silu_g = g / (1.0f + __expf(-g));
             dst[j*nrows_dst + row0 + threadIdx.x] = silu_g * u;
         }
@@ -3634,7 +3652,7 @@ static __device__ void mul_mat_vec_q4K_pf(
         }
 
         if (threadIdx.x < rows_per_cuda_block) {
-            dst[j*nrows_dst + row0 + threadIdx.x] = tmp[j][threadIdx.x];
+            dst[j*nrows_dst + row0 + threadIdx.x] = mmvq_pick_row(tmp[j]);
         }
     }
 }
@@ -3744,8 +3762,8 @@ static __device__ void mul_mat_vec_q4K_glu_pf(
         }
 
         if (threadIdx.x < rows_per_cuda_block) {
-            const float g = tmp_g[j][threadIdx.x];
-            const float u = tmp_u[j][threadIdx.x];
+            const float g = mmvq_pick_row(tmp_g[j]);
+            const float u = mmvq_pick_row(tmp_u[j]);
             const float silu_g = g / (1.0f + __expf(-g));
             dst[j*nrows_dst + row0 + threadIdx.x] = silu_g * u;
         }

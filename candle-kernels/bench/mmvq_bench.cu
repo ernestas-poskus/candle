@@ -122,11 +122,12 @@ typedef void (*glu_t)(const void*, const void*, const void*, float*, int, int, i
 
 static const size_t POOL = 2ull << 30;
 
-static void fill_pool(char *dev, size_t block_bytes, size_t d_off, size_t d_len) {
+static void fill_pool(char *dev, size_t block_bytes, size_t d_off, size_t d_len, size_t sc_off = 0, size_t sc_len = 0) {
   std::vector<char> h(64 << 20);
   for (size_t i = 0; i < h.size(); ++i) h[i] = (char)(rand() & 0xff);
   for (size_t b = 0; b + block_bytes <= h.size(); b += block_bytes)
-    for (size_t j = 0; j < d_len; j += 2) { h[b + d_off + j] = 0x00; h[b + d_off + j + 1] = 0x20; }
+    { for (size_t j = 0; j < d_len; j += 2) { h[b + d_off + j] = 0x00; h[b + d_off + j + 1] = 0x20; }
+      for (size_t j = 0; j < sc_len; ++j) h[b + sc_off + j] = (char)(1 + (j & 3)); }
   size_t chunk = (h.size() / block_bytes) * block_bytes;
   for (size_t o = 0; o + chunk <= POOL; o += chunk) CK(cudaMemcpy(dev + o, h.data(), chunk, cudaMemcpyHostToDevice));
 }
@@ -165,7 +166,7 @@ int main(int argc, char **argv) {
   q4k_glu_pf[1]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda1; q4k_glu_pf[2]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda2; q4k_glu_pf[3]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda3; q4k_glu_pf[4]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda4;
   q4k_glu_pf[5]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda5; q4k_glu_pf[6]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda6; q4k_glu_pf[7]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda7; q4k_glu_pf[8]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda8;
 
-  VAR(2,4) VAR(4,4) VAR(8,4) VAR(4,2) VAR(8,2)
+  VAR(2,4) VAR(4,4) VAR(4,2)
   cudaDeviceProp p; CK(cudaGetDeviceProperties(&p, 0));
   printf("device %s, %d SMs, L2 %d KB\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 10);
   Ctx c;
@@ -174,7 +175,7 @@ int main(int argc, char **argv) {
   CK(cudaMalloc(&c.dst, 8 * 12288 * sizeof(float)));
   CK(cudaEventCreate(&c.a)); CK(cudaEventCreate(&c.b));
   fill_pool(c.q4k, sizeof(block_q4_K), 0, 4);
-  fill_pool(c.q6k, sizeof(block_q6_K), offsetof(block_q6_K, d), 2);
+  fill_pool(c.q6k, sizeof(block_q6_K), offsetof(block_q6_K, d), 2, offsetof(block_q6_K, scales), QK_K/16);
   CK(cudaMemset(c.y, 0x11, 8 * 12288 / 32 * sizeof(block_q8_1)));
 
   // Peak: a plain device-to-device copy of 512 MB.
