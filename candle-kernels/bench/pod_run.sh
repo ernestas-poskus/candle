@@ -19,3 +19,6 @@ if [ ! -f /root/base_done ]; then
    | grep -iE -A3 "test result|panicked|FAILED" | head -40)
   touch /root/base_done
 fi
+echo "=== branch quantized_tests, one test thread"
+cargo test -q --release -p candle-core --features cuda --test quantized_tests -- --test-threads=1 2>&1 \
+  | grep -iE -A3 "test result|panicked|FAILED" | head -40
