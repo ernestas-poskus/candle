@@ -27,12 +27,17 @@ fn each_column_matches_its_single_column_run() -> Result<()> {
             let q = QTensor::quantize(&w, dtype)?;
             let dense = q.dequantize(&dev)?;
             let q = QMatMul::from_qtensor(q)?;
-            let xs = Tensor::from_vec(pseudo(8 * k, 40_503 * 65_537), (8, k), &dev)?;
+            let x = pseudo(8 * k, 40_503 * 65_537);
+            // The CUDA matvec reads its activation from offset 0 of the
+            // storage, so every batch gets its own buffer, not a row view.
+            let rows = |from: usize, b: usize| {
+                Tensor::from_vec(x[from * k..(from + b) * k].to_vec(), (b, k), &dev)
+            };
 
             let solo: Vec<Vec<f32>> = (0..8)
-                .map(|c| q.forward(&xs.narrow(0, c, 1)?)?.flatten_all()?.to_vec1())
+                .map(|c| q.forward(&rows(c, 1)?)?.flatten_all()?.to_vec1())
                 .collect::<Result<_>>()?;
-            let reference = xs.matmul(&dense.t()?)?.to_vec2::<f32>()?;
+            let reference = rows(0, 8)?.matmul(&dense.t()?)?.to_vec2::<f32>()?;
             for (c, (got, want)) in solo.iter().zip(&reference).enumerate() {
                 let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
                 let worst = got
@@ -46,7 +51,7 @@ fn each_column_matches_its_single_column_run() -> Result<()> {
             }
 
             for b in 2..=8 {
-                let batched = q.forward(&xs.narrow(0, 0, b)?)?.to_vec2::<f32>()?;
+                let batched = q.forward(&rows(0, b)?)?.to_vec2::<f32>()?;
                 for (c, row) in batched.iter().enumerate() {
                     let same = row
                         .iter()
