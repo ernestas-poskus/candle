@@ -25,14 +25,15 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Software-pipelined `..._pf_cuda*` q4_K matvecs are
-/// ON by default after an A/B on RTX 3090 (350 W, same binary:
-/// −5.1% wall at 8 concurrent sequences, neutral at 4; bit-exact
-/// checksums and fused-GLU equivalence green).
-/// `CANDLE_MMVQ_PREFETCH=0` restores the standard kernels.
+/// Software-pipelined `..._pf_cuda*` q4_K matvecs, OFF by default and
+/// enabled by `CANDLE_MMVQ_PREFETCH=1`. They won −5.1% wall at 8 concurrent
+/// sequences while the standard kernels kept their accumulators in local
+/// memory; with the accumulators in registers the standard kernels are
+/// faster at every decode shape and ncols 4-8 (cold-DRAM bench on RTX 3090,
+/// `candle-kernels/bench/mmvq_bench.cu`). Both produce identical bits.
 fn mmvq_prefetch_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("CANDLE_MMVQ_PREFETCH").is_ok_and(|v| v == "0"))
+    *ON.get_or_init(|| std::env::var("CANDLE_MMVQ_PREFETCH").is_ok_and(|v| v == "1"))
 }
 
 /// Grow-only per-device scratch for the activation-quantization buffer:
@@ -428,10 +429,24 @@ fn mul_mat_vec_via_q8_1(
     // pressure dominates). Disjoint from `use_volta_turing_w2`, which is
     // b_size == 1 only, so the two variant selections cannot both apply.
     let use_q4k_prefetch = dtype == GgmlDType::Q4K && b_size >= 5 && mmvq_prefetch_enabled();
+    // Four rows per block for the wide-K matvecs (ffn_down, K = 12288) at
+    // ncols 5-8: each activation load feeds four rows instead of two. Same
+    // math and summation order, so the output is bit-identical; measured
+    // faster only at K >= 8192 and ncols >= 5 (q4_K 72 -> 53 us, q6_K
+    // 94 -> 86 us at ncols 5 on RTX 3090). The kernel writes four rows per
+    // block unguarded, so nrows must be a multiple of 4.
+    let use_rows4 = matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K)
+        && b_size >= 5
+        && ncols >= 8192
+        && nrows % 4 == 0
+        && !use_q4k_prefetch;
     let kernel_name = if use_volta_turing_w2 {
         format!("{kernel_name}{b_size}_w2")
     } else if use_q4k_prefetch {
         format!("mul_mat_vec_q4_K_q8_1_pf_cuda{b_size}")
+    } else if use_rows4 {
+        let t = if dtype == GgmlDType::Q4K { "q4_K" } else { "q6_K" };
+        format!("mul_mat_vec_{t}_q8_1_r4_cuda{b_size}")
     } else {
         format!("{kernel_name}{b_size}")
     };
@@ -439,6 +454,7 @@ fn mul_mat_vec_via_q8_1(
     let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
     let (nblocks, nwarps) = match b_size {
+        _ if use_rows4 => (nrows as u32 / 4, 4),
         1 if use_volta_turing_w2 => (nrows as u32, 2),
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32 + 1) / 2, 4),

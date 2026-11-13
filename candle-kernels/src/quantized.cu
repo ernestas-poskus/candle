@@ -2644,7 +2644,7 @@ static __device__ __forceinline__ float mmvq_pick_row(const float (&t)[R]) {
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs);
 
 template <int ncols_y, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda,
-          int nwarps_override = 0>
+          int nwarps_override = 0, int rows_override = 0>
 static __device__ void mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
@@ -2663,7 +2663,7 @@ static __device__ void mul_mat_vec_q(
     // reduction storage stays small (<= 6 KB at ncols 8). Kept as the
     // fallback rather than hardcoded, so an explicit override still wins.
     constexpr int nwarps              = nwarps_override != 0 ? nwarps_override : 4;
-    constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
+    constexpr int rows_per_cuda_block = rows_override != 0 ? rows_override : (ncols_y == 1 ? 1 : 2);
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
@@ -3394,6 +3394,30 @@ extern "C" __global__ void mul_mat_vec_q6_K_q8_1_cuda8(
     mul_mat_vec_q<8, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
+
+// Four output rows per block for the wide-K decode matvecs (ffn_down,
+// K = 12288) at ncols 5-8: each activation load then feeds four rows instead
+// of two. Same thread-to-block mapping and summation order as the two-row
+// kernels, so the output is bit-identical. Cold-DRAM bench on RTX 3090 at
+// ncols 5: q4_K 72 -> 53 us, q6_K 94 -> 86 us; at ncols 4 and K = 4096 it
+// is slower, which the host dispatch keeps it away from.
+#define MMVQ_R4_ENTRY(T, QI, BLOCK, VDR, DOT, N) \
+extern "C" __global__ void mul_mat_vec_##T##_q8_1_r4_cuda##N( \
+    const void * vx, const void * vy, float * dst, \
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) { \
+    mul_mat_vec_q<N, QK_K, QI, BLOCK, VDR, DOT, 0, 4>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); \
+}
+
+MMVQ_R4_ENTRY(q4_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 5)
+MMVQ_R4_ENTRY(q4_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 6)
+MMVQ_R4_ENTRY(q4_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 7)
+MMVQ_R4_ENTRY(q4_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 8)
+MMVQ_R4_ENTRY(q6_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1, 5)
+MMVQ_R4_ENTRY(q6_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1, 6)
+MMVQ_R4_ENTRY(q6_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1, 7)
+MMVQ_R4_ENTRY(q6_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1, 8)
+
+#undef MMVQ_R4_ENTRY
 
 // Fused SwiGLU matvec: dst = silu(gate·y) * (up·y), both weight matrices
 // walked in lockstep over one shared quantized-activation buffer, SiLU and
