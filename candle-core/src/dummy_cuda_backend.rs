@@ -278,6 +278,10 @@ pub fn gemm_reduced_precision_f32() -> bool {
     true
 }
 
+pub fn set_thread_gemm_reduced_precision_f32(_: Option<bool>) -> Option<bool> {
+    None
+}
+
 /// This bool controls whether reduced precision reductions (e.g., with tf32 accumulation type) are
 /// allowed with f32 GEMMs.
 pub fn set_gemm_reduced_precision_f32(_b: bool) {}
