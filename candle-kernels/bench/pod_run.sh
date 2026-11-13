@@ -8,4 +8,4 @@ command -v cargo >/dev/null || { curl -sSf https://sh.rustup.rs | sh -s -- -y -q
 export CUDA_COMPUTE_CAP=86
 cargo test -q --release -p candle-core --features cuda \
   --test mmvq_batch_invariance_tests --test fused_swiglu_tests --test mmvq_prefetch_tests --test quantized_tests 2>&1 \
-  | grep -E "^test |test result|panicked|error|FAILED|MMVQ_CHECKSUM" | head -80
+  | grep -iE -A3 "^test |test result|panicked|error|FAILED|MMVQ_CHECKSUM" | head -120
