@@ -2126,7 +2126,23 @@ static MM_F32_REDUCED_PRECISION: std::sync::atomic::AtomicBool =
 /// This bool controls whether reduced precision reductions (e.g., with tf32 accumulation type) are
 /// allowed with f32 GEMMs.
 pub fn gemm_reduced_precision_f32() -> bool {
-    MM_F32_REDUCED_PRECISION.load(std::sync::atomic::Ordering::Relaxed)
+    THREAD_F32_REDUCED_PRECISION
+        .with(|t| t.get())
+        .unwrap_or_else(|| MM_F32_REDUCED_PRECISION.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+thread_local! {
+    static THREAD_F32_REDUCED_PRECISION: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Overrides [`gemm_reduced_precision_f32`] for f32 GEMMs launched from the
+/// calling thread only (`None` falls back to the process-wide setting). Lets
+/// one worker, such as an audio codec thread, use TF32 tensor cores while
+/// other threads keep full f32 GEMMs, for example logit heads whose ranking
+/// must not shift. Returns the previous override so scopes can nest.
+pub fn set_thread_gemm_reduced_precision_f32(b: Option<bool>) -> Option<bool> {
+    THREAD_F32_REDUCED_PRECISION.with(|t| t.replace(b))
 }
 
 /// This bool controls whether reduced precision reductions (e.g., with tf32 accumulation type) are
