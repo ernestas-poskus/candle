@@ -128,10 +128,21 @@ impl CudaDevice {
     fn htod_copy_slice_nosync<T: DeviceRepr>(&self, src: &[T]) -> Result<CudaSlice<T>> {
         let mut dst = unsafe { self.alloc(src.len()) }.w()?;
         self.bind_to_thread().w()?;
-        unsafe {
-            cudarc::driver::result::memcpy_htod_async(*dst.device_ptr_mut(), src, *self.cu_stream())
+        let stream = *self.cu_stream();
+        let bytes = std::mem::size_of_val(src);
+        if let Some(staged) = pinned_stage(stream, src.as_ptr() as *const u8, bytes)? {
+            // The staged bytes are a copy of `src` in page-locked memory.
+            let staged = unsafe { std::slice::from_raw_parts(staged as *const T, src.len()) };
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(*dst.device_ptr_mut(), staged, stream)
+            }
+            .w()?;
+        } else {
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(*dst.device_ptr_mut(), src, stream)
+            }
+            .w()?;
         }
-        .w()?;
         Ok(dst)
     }
 
@@ -549,31 +560,31 @@ impl BackendDevice for CudaDevice {
     fn storage_from_cpu_storage_owned(&self, storage: CpuStorage) -> Result<CudaStorage> {
         let slice = match storage {
             CpuStorage::U8(storage) => {
-                let data = self.htod_copy(storage).w()?;
+                let data = self.htod_copy_slice_nosync(&storage)?;
                 CudaStorageSlice::U8(data)
             }
             CpuStorage::U32(storage) => {
-                let data = self.htod_copy(storage).w()?;
+                let data = self.htod_copy_slice_nosync(&storage)?;
                 CudaStorageSlice::U32(data)
             }
             CpuStorage::I64(storage) => {
-                let data = self.htod_copy(storage).w()?;
+                let data = self.htod_copy_slice_nosync(&storage)?;
                 CudaStorageSlice::I64(data)
             }
             CpuStorage::BF16(storage) => {
-                let data = self.htod_copy(storage).w()?;
+                let data = self.htod_copy_slice_nosync(&storage)?;
                 CudaStorageSlice::BF16(data)
             }
             CpuStorage::F16(storage) => {
-                let data = self.htod_copy(storage).w()?;
+                let data = self.htod_copy_slice_nosync(&storage)?;
                 CudaStorageSlice::F16(data)
             }
             CpuStorage::F32(storage) => {
-                let data = self.htod_copy(storage).w()?;
+                let data = self.htod_copy_slice_nosync(&storage)?;
                 CudaStorageSlice::F32(data)
             }
             CpuStorage::F64(storage) => {
-                let data = self.htod_copy(storage).w()?;
+                let data = self.htod_copy_slice_nosync(&storage)?;
                 CudaStorageSlice::F64(data)
             }
         };
@@ -587,4 +598,82 @@ impl BackendDevice for CudaDevice {
         self.device.synchronize().map_err(crate::Error::wrap)?;
         Ok(())
     }
+}
+
+/// Pinned staging for small host-to-device copies.
+///
+/// A copy from pageable memory blocks the host until the DMA runs, and the
+/// DMA runs in stream order, so every small upload (token ids, positions,
+/// penalty indices) waited for all queued kernels: the host could never get
+/// ahead of the GPU. Staging through page-locked memory makes the copy
+/// asynchronous. The ring is reused in laps; on each wrap the host waits once
+/// for the previous lap's copies (an event recorded on the stream), which at
+/// decode rates is once per thousands of steps. Copies above
+/// `PINNED_MAX_COPY`, and any issued while the stream is capturing a CUDA
+/// graph, keep the pageable path. `CANDLE_PINNED_HTOD=0` turns it off.
+const PINNED_RING_BYTES: usize = 32 << 20;
+const PINNED_MAX_COPY: usize = 1 << 20;
+
+struct PinnedRing {
+    base: usize,
+    head: usize,
+    wrap_event: cudarc::driver::sys::CUevent,
+}
+
+// The ring is only touched under `PINNED_RINGS`'s lock.
+unsafe impl Send for PinnedRing {}
+
+static PINNED_RINGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, PinnedRing>>> =
+    std::sync::OnceLock::new();
+
+/// Copies `bytes` from `src` into the stream's pinned ring and returns the
+/// staged host pointer, or `None` when the caller should copy from `src`.
+fn pinned_stage(
+    stream: cudarc::driver::sys::CUstream,
+    src: *const u8,
+    bytes: usize,
+) -> Result<Option<*const u8>> {
+    use cudarc::driver::result;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| !std::env::var("CANDLE_PINNED_HTOD").is_ok_and(|v| v == "0")) {
+        return Ok(None);
+    }
+    if bytes == 0 || bytes > PINNED_MAX_COPY {
+        return Ok(None);
+    }
+    if cudarc::driver::capture_status(stream)
+        != Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+    {
+        return Ok(None);
+    }
+    let rings = PINNED_RINGS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut rings = rings.lock().unwrap_or_else(|e| e.into_inner());
+    let ring = match rings.entry(stream as usize) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            // Portable (flag 1) so the pages stay valid in every context.
+            let base = unsafe { result::malloc_host(PINNED_RING_BYTES, 1) }.w()? as usize;
+            let wrap_event =
+                result::event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                    .w()?;
+            e.insert(PinnedRing {
+                base,
+                head: 0,
+                wrap_event,
+            })
+        }
+    };
+    let len = (bytes + 255) & !255;
+    if ring.head + len > PINNED_RING_BYTES {
+        // Everything staged in the previous lap must be read before reuse.
+        unsafe {
+            result::event::record(ring.wrap_event, stream).w()?;
+            result::event::synchronize(ring.wrap_event).w()?;
+        }
+        ring.head = 0;
+    }
+    let dst = (ring.base + ring.head) as *mut u8;
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, bytes) };
+    ring.head += len;
+    Ok(Some(dst as *const u8))
 }
