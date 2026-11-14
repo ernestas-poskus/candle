@@ -32,6 +32,19 @@ use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
 
+/// A large-M quantized matmul that replaces the dequantize + F32 GEMM path
+/// on CUDA (`QMatMul::forward`, M >= 64). It returns `Ok(None)` to decline a
+/// weight or input, and the F32 path runs instead.
+pub type LargeMMatmul = fn(&Tensor, &QTensor) -> Result<Option<Tensor>>;
+
+static LARGE_M_MATMUL: std::sync::OnceLock<LargeMMatmul> = std::sync::OnceLock::new();
+
+/// Registers the large-M matmul for the process. Only the first call takes
+/// effect; it returns whether this call installed `matmul`.
+pub fn set_large_m_matmul(matmul: LargeMMatmul) -> bool {
+    LARGE_M_MATMUL.set(matmul).is_ok()
+}
+
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
@@ -963,6 +976,11 @@ impl crate::Module for QMatMul {
                 let k = xs.dims().last().copied().unwrap_or(0);
                 let m = if k == 0 { 0 } else { xs.elem_count() / k };
                 if matches!(t.device(), Device::Cuda(_)) && m >= 64 {
+                    if let Some(matmul) = LARGE_M_MATMUL.get() {
+                        if let Some(out) = matmul(xs, t)? {
+                            return Ok(out);
+                        }
+                    }
                     self.forward_via_f32(xs)
                 } else {
                     xs.apply_op1_no_bwd(t.as_ref())
