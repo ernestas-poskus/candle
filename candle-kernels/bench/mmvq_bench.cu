@@ -11,6 +11,7 @@
 #include <vector>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 
 // ---- Variants: R rows per CTA (R output rows share each activation load), NW warps.
@@ -374,6 +375,32 @@ int main(int argc, char **argv) {
   double cp = time_us(c, 10, [&](int) { CK(cudaMemcpyAsync(c.q6k, c.q4k, 512 << 20, cudaMemcpyDeviceToDevice)); });
   printf("memcpy D2D %.0f GB/s (read+write)\n", 2.0 * (512 << 20) / cp / 1e3);
 
+  if (argc > 2 && !strcmp(argv[2], "glu")) {
+    const int n = 12288, k = 4096, rounds = 7;
+    size_t mbytes = (size_t)(k / 256) * sizeof(block_q4_K) * n;
+    size_t slots = POOL / mbytes - 1;
+    struct G { const char *name; glu_t f[9]; int rows, nw; bool shm; };
+    std::vector<G> gs;
+    { G g{"std", {}, 2, 4, false}; for (int c = 1; c <= 8; ++c) g.f[c] = q4k_glu[c]; gs.push_back(g); }
+    for (auto &v : vars) if (v.R == 2) { G g{v.name, {}, v.R, v.NW, false}; for (int c : {4,5,8}) g.f[c] = v.glu[c]; gs.push_back(g); }
+    for (auto &v : hvars) { G g{v.name, {}, v.R, v.NW, false}; for (int c : {4,5,8}) g.f[c] = v.glu[c]; gs.push_back(g); }
+    for (auto &v : svars) { G g{v.name, {}, v.R, v.NW, true}; for (int c : {4,5,8}) g.f[c] = v.glu[c]; gs.push_back(g); }
+    for (int nc : {4, 5, 8}) {
+      std::vector<std::vector<double>> t(gs.size());
+      for (int r = 0; r < rounds; ++r)
+        for (size_t gi = 0; gi < gs.size(); ++gi) {
+          auto &g = gs[gi]; dim3 grid(n / g.rows), block(32, g.nw);
+          size_t sm = g.shm ? (size_t)nc * (k / QK8_1) * sizeof(block_q8_1) : 0;
+          t[gi].push_back(time_us(c, iters, [&](int i) { char *w = c.q4k + (i % slots) * mbytes;
+            g.f[nc]<<<grid, block, sm>>>(w, w + mbytes, c.y, c.dst, k, n, k, n); }));
+        }
+      for (size_t gi = 0; gi < gs.size(); ++gi) {
+        auto v = t[gi]; std::sort(v.begin(), v.end());
+        printf("glu ncols %d %-6s min %7.2f med %7.2f us  min %4.0f GB/s\n", nc, gs[gi].name, v[0], v[rounds/2], 2.0 * mbytes / v[0] / 1e3);
+      }
+    }
+    return 0;
+  }
   struct Shape { const char *name; int n, k; bool q6; bool glu; };
   Shape shapes[] = {
     {"q/o q4K", 4096, 4096, false, false}, {"k/v q4K", 1024, 4096, false, false},

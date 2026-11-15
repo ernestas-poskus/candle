@@ -2,7 +2,7 @@
 # quantized CUDA tests. Output goes to stdout.
 set -u
 nvidia-smi --query-gpu=name,power.limit --format=csv,noheader
-B=/root/bench_done_$(git rev-parse --short HEAD); [ -f $B ] || (cd candle-kernels/bench && nvcc -O3 -arch=sm_86 -std=c++17 -I../src mmvq_bench.cu -o /root/b 2>&1 | grep -E "error" ; /root/b 2>&1; touch $B)
+B=/root/bench_done_$(git rev-parse --short HEAD); [ -f $B ] || (cd candle-kernels/bench && nvcc -O3 -arch=sm_86 -std=c++17 -I../src mmvq_bench.cu -o /root/b 2>&1 | grep -E "error" ; /root/b 200 glu 2>&1; touch $B)
 command -v cargo >/dev/null || { curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal >/dev/null 2>&1; }
 . "$HOME/.cargo/env"
 export CUDA_COMPUTE_CAP=86
