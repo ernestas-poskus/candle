@@ -208,6 +208,95 @@ __global__ void glu_h(const void * __restrict__ vg, const void * __restrict__ vu
   }
 }
 
+
+// Shared-activation glu: the CTA stages all ncols activation vectors in
+// shared memory once, then each warp owns RW output rows over the full K
+// (no cross-warp reduction). Rows per CTA = RW*NW, so each activation byte
+// leaves L2 once per RW*NW rows instead of once per 2.
+template <int ncols_y, int RW, int NW>
+__global__ void glu_s(const void * __restrict__ vg, const void * __restrict__ vu, const void * __restrict__ vy,
+    float * __restrict__ dst, const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+  constexpr int qk = QK_K, qi = QI4_K, vdr = VDR_Q4_K_Q8_1_MMVQ;
+  extern __shared__ int ys_raw[];
+  const int blocks_per_row_x = ncols_x / qk;
+  const int blocks_per_col_y = nrows_y / QK8_1;
+  {
+    const int n_ints = ncols_y * blocks_per_col_y * (int)(sizeof(block_q8_1) / 4);
+    const int * src = (const int *) vy;
+    for (int t = WARP_SIZE*threadIdx.y + threadIdx.x; t < n_ints; t += NW*WARP_SIZE) ys_raw[t] = src[t];
+  }
+  __syncthreads();
+  const block_q8_1 * y = (const block_q8_1 *) ys_raw;
+  const int lane = threadIdx.x;
+  const int row0 = (blockIdx.x*NW + threadIdx.y) * RW;
+  constexpr int blocks_per_iter = vdr * WARP_SIZE / qi;
+  float tg[ncols_y][RW] = {0.0f}, tu[ncols_y][RW] = {0.0f};
+  const block_q4_K * xg = (const block_q4_K *) vg;
+  const block_q4_K * xu = (const block_q4_K *) vu;
+  const int kqs = vdr * (lane % (qi/vdr));
+  const int bq8_offset = QR4_K * ((kqs/2) / (QI8_1/2));
+  const int q4_off = 16 * bq8_offset + 4 * ((kqs/2)%4);
+  const int js = bq8_offset/2, jm = js & 1;
+  const uint32_t hi = (uint32_t) -(int32_t) (js >= 2);
+  for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    const int kby = kbx * (qk/QK8_1);
+    int wv[2][RW][2]; uint16_t wsc[2][RW][2]; float2 wdm[2][RW];
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+      for (int i = 0; i < RW; ++i) {
+        const block_q4_K * b = (m == 0 ? xg : xu) + kbx + (row0 + i)*blocks_per_row_x;
+        const int * q4 = (const int *)(b->qs + q4_off);
+        wv[m][i][0] = q4[0]; wv[m][i][1] = q4[4];
+        const uint16_t * scales = (const uint16_t *)b->scales;
+        const uint32_t s0 = scales[jm + 0], s2 = scales[jm + 2], s4 = scales[jm + 4];
+        wsc[m][i][0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+        wsc[m][i][1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+        wdm[m][i] = __half22float2(b->dm);
+      }
+#pragma unroll
+    for (int j = 0; j < ncols_y; ++j) {
+      int u[2*QR4_K]; float d8[QR4_K]; int su[QR4_K];
+#pragma unroll
+      for (int ii = 0; ii < QR4_K; ++ii) {
+        const block_q8_1 * bq8i = y + j*blocks_per_col_y + kby + bq8_offset + ii;
+        d8[ii] = __low2float(bq8i->ds);
+        const int * q8 = (const int *)bq8i->qs + ((kqs/2)%4);
+        u[2*ii+0] = q8[0]; u[2*ii+1] = q8[4];
+        su[ii] = ggml_cuda_dp4a(0x01010101, u[2*ii+1], ggml_cuda_dp4a(0x01010101, u[2*ii+0], 0));
+      }
+#pragma unroll
+      for (int m = 0; m < 2; ++m)
+#pragma unroll
+        for (int i = 0; i < RW; ++i) {
+          const uint8_t * sc = (const uint8_t *)wsc[m][i];
+          float sd = 0.0f, sm = 0.0f;
+#pragma unroll
+          for (int ii = 0; ii < QR4_K; ++ii) {
+            const int v0i = (wv[m][i][0] >> (4*ii)) & 0x0F0F0F0F;
+            const int v1i = (wv[m][i][1] >> (4*ii)) & 0x0F0F0F0F;
+            const int dot1 = ggml_cuda_dp4a(v1i, u[2*ii+1], ggml_cuda_dp4a(v0i, u[2*ii+0], 0));
+            sd += d8[ii] * (dot1 * sc[ii]);
+            sm += d8[ii] * (su[ii] * sc[2 + ii]);
+          }
+          const float r = wdm[m][i].x*sd - wdm[m][i].y*sm;
+          if (m == 0) tg[j][i] += r; else tu[j][i] += r;
+        }
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+    for (int i = 0; i < RW; ++i) { tg[j][i] = warp_reduce_sum(tg[j][i]); tu[j][i] = warp_reduce_sum(tu[j][i]); }
+    if (lane < RW) {
+      float g = tg[j][0], u = tu[j][0];
+#pragma unroll
+      for (int i = 1; i < RW; ++i) if (lane == i) { g = tg[j][i]; u = tu[j][i]; }
+      dst[j*nrows_dst + row0 + lane] = g / (1.0f + __expf(-g)) * u;
+    }
+  }
+}
+
 #define Q4R(N,R,NW) mmvq_r<N,R,NW,QK_K,QI4_K,block_q4_K,VDR_Q4_K_Q8_1_MMVQ,vec_dot_q4_K_q8_1>
 #define Q6R(N,R,NW) mmvq_r<N,R,NW,QK_K,QI6_K,block_q6_K,VDR_Q6_K_Q8_1_MMVQ,vec_dot_q6_K_q8_1>
 
@@ -245,7 +334,8 @@ static double time_us(Ctx &c, int iters, F launch) {
 
 struct Var { const char *name; int R, NW; mmvq_t q4[9], q6[9]; glu_t glu[9]; };
 struct HVar { const char *name; int R, NW; glu_t glu[9]; };
-static std::vector<HVar> hvars;
+static std::vector<HVar> hvars, svars;
+#define SVAR(RW,NW) { HVar v{"s" #RW "w" #NW, RW*NW, NW}; v.glu[1]=glu_s<1,RW,NW>; v.glu[4]=glu_s<4,RW,NW>; v.glu[5]=glu_s<5,RW,NW>; v.glu[8]=glu_s<8,RW,NW>; svars.push_back(v); }
 #define HVAR(R,NW) { HVar v{"h" #R "w" #NW, R, NW}; v.glu[1]=glu_h<1,R,NW>; v.glu[4]=glu_h<4,R,NW>; v.glu[5]=glu_h<5,R,NW>; v.glu[8]=glu_h<8,R,NW>; hvars.push_back(v); }
 #define VROW(N,R,NW) v.q4[N]=Q4R(N,R,NW); v.q6[N]=Q6R(N,R,NW); v.glu[N]=glu_r<N,R,NW>;
 #define VAR(R,NW) { Var v{"r" #R "w" #NW, R, NW}; VROW(1,R,NW) VROW(4,R,NW) VROW(5,R,NW) VROW(8,R,NW) vars.push_back(v); }
@@ -267,7 +357,8 @@ int main(int argc, char **argv) {
   q4k_glu_pf[5]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda5; q4k_glu_pf[6]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda6; q4k_glu_pf[7]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda7; q4k_glu_pf[8]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda8;
 
   VAR(2,4) VAR(4,4) VAR(4,2)
-  HVAR(2,4) HVAR(1,4) HVAR(4,4) HVAR(2,2)
+  HVAR(2,4) HVAR(2,2)
+  SVAR(2,4) SVAR(1,8) SVAR(2,8) SVAR(4,4) SVAR(1,16)
   cudaDeviceProp p; CK(cudaGetDeviceProperties(&p, 0));
   printf("device %s, %d SMs, L2 %d KB\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 10);
   Ctx c;
@@ -317,6 +408,9 @@ int main(int argc, char **argv) {
         run("pf", [&](int i) { char *g = pool + (i % slots) * mbytes; q4k_glu_pf[nc]<<<grid, block>>>(g, g + mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); });
         for (auto &v : vars) { if (nc == 1 && v.R > 1) continue; dim3 g2(s.n / v.R), b2(32, v.NW);
           run(v.name, [&](int i) { char *g = pool + (i % slots) * mbytes; v.glu[nc]<<<g2, b2>>>(g, g + mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); }); }
+        for (auto &v : svars) { if (nc == 1) continue; dim3 g2(s.n / v.R), b2(32, v.NW);
+          size_t sm = (size_t)nc * (nrows_y / QK8_1) * sizeof(block_q8_1);
+          run(v.name, [&](int i) { char *g = pool + (i % slots) * mbytes; v.glu[nc]<<<g2, b2, sm>>>(g, g + mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); }); }
         for (auto &v : hvars) { if (nc == 1 && v.R > 1) continue; dim3 g2(s.n / v.R), b2(32, v.NW);
           run(v.name, [&](int i) { char *g = pool + (i % slots) * mbytes; v.glu[nc]<<<g2, b2>>>(g, g + mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); }); }
       } else if (s.q6) {
