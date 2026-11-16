@@ -610,7 +610,7 @@ impl BackendDevice for CudaDevice {
 /// for the previous lap's copies (an event recorded on the stream), which at
 /// decode rates is once per thousands of steps. Copies above
 /// `PINNED_MAX_COPY`, and any issued while the stream is capturing a CUDA
-/// graph, keep the pageable path. `CANDLE_PINNED_HTOD=0` turns it off.
+/// graph, keep the pageable path.
 const PINNED_RING_BYTES: usize = 32 << 20;
 const PINNED_MAX_COPY: usize = 1 << 20;
 
@@ -634,10 +634,6 @@ fn pinned_stage(
     bytes: usize,
 ) -> Result<Option<*const u8>> {
     use cudarc::driver::result;
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| !std::env::var("CANDLE_PINNED_HTOD").is_ok_and(|v| v == "0")) {
-        return Ok(None);
-    }
     if bytes == 0 || bytes > PINNED_MAX_COPY {
         return Ok(None);
     }

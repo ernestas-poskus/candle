@@ -38,17 +38,13 @@ const GLU_SHARED_MAX_SMEM: usize = 48 * 1024;
 /// ordered before the next `quantize_q8_1` that overwrites it. While a
 /// CUDA graph capture is active the scratch is bypassed: an allocation
 /// captured into a graph becomes graph-owned memory that must not be
-/// shared with eager calls. `CANDLE_Q8_SCRATCH=0` disables it.
+/// shared with eager calls.
 fn q8_1_scratch(
     dev: &CudaDevice,
     need_bytes: usize,
 ) -> Result<Option<std::sync::Arc<CudaSlice<u8>>>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| !std::env::var("CANDLE_Q8_SCRATCH").is_ok_and(|v| v == "0")) {
-        return Ok(None);
-    }
     let capturing = cudarc::driver::capture_status(*dev.cu_stream())
         == Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE);
     if capturing {
@@ -926,15 +922,8 @@ impl QCudaStorage {
             // with ncols (per-column serial dot chains), flattening batched
             // decode throughput past ~4 concurrent sequences (measured
             // on RTX 3090); the MMQ tile kernels amortize weights
-            // across the whole tile instead. Default stays 8; overridable
-            // for measurement via CANDLE_MMVQ_MAX_BM.
-            static MAX_BM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            *MAX_BM.get_or_init(|| {
-                std::env::var("CANDLE_MMVQ_MAX_BM")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(8)
-            })
+            // across the whole tile instead. Fixed at 8.
+            8
         };
         let use_vec_kernel = match layout.shape().dims() {
             [b, m, _k] => b * m <= max_bm,
