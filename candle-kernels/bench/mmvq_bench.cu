@@ -341,21 +341,17 @@ static std::vector<HVar> hvars, svars;
 #define VROW(N,R,NW) v.q4[N]=Q4R(N,R,NW); v.q6[N]=Q6R(N,R,NW); v.glu[N]=glu_r<N,R,NW>;
 #define VAR(R,NW) { Var v{"r" #R "w" #NW, R, NW}; VROW(1,R,NW) VROW(4,R,NW) VROW(5,R,NW) VROW(8,R,NW) vars.push_back(v); }
 static std::vector<Var> vars;
-static mmvq_t q4k_std[9], q4k_pf[9], q6k_std[9];
-static glu_t q4k_glu[9], q4k_glu_pf[9];
+static mmvq_t q4k_std[9], q6k_std[9];
+static glu_t q4k_glu[9];
 
 int main(int argc, char **argv) {
   int iters = argc > 1 ? atoi(argv[1]) : 400;
   q4k_std[1]=mul_mat_vec_q4_K_q8_1_cuda1; q4k_std[2]=mul_mat_vec_q4_K_q8_1_cuda2; q4k_std[3]=mul_mat_vec_q4_K_q8_1_cuda3; q4k_std[4]=mul_mat_vec_q4_K_q8_1_cuda4;
   q4k_std[5]=mul_mat_vec_q4_K_q8_1_cuda5; q4k_std[6]=mul_mat_vec_q4_K_q8_1_cuda6; q4k_std[7]=mul_mat_vec_q4_K_q8_1_cuda7; q4k_std[8]=mul_mat_vec_q4_K_q8_1_cuda8;
-  q4k_pf[1]=mul_mat_vec_q4_K_q8_1_pf_cuda1; q4k_pf[2]=mul_mat_vec_q4_K_q8_1_pf_cuda2; q4k_pf[3]=mul_mat_vec_q4_K_q8_1_pf_cuda3; q4k_pf[4]=mul_mat_vec_q4_K_q8_1_pf_cuda4;
-  q4k_pf[5]=mul_mat_vec_q4_K_q8_1_pf_cuda5; q4k_pf[6]=mul_mat_vec_q4_K_q8_1_pf_cuda6; q4k_pf[7]=mul_mat_vec_q4_K_q8_1_pf_cuda7; q4k_pf[8]=mul_mat_vec_q4_K_q8_1_pf_cuda8;
   q6k_std[1]=mul_mat_vec_q6_K_q8_1_cuda1; q6k_std[2]=mul_mat_vec_q6_K_q8_1_cuda2; q6k_std[3]=mul_mat_vec_q6_K_q8_1_cuda3; q6k_std[4]=mul_mat_vec_q6_K_q8_1_cuda4;
   q6k_std[5]=mul_mat_vec_q6_K_q8_1_cuda5; q6k_std[6]=mul_mat_vec_q6_K_q8_1_cuda6; q6k_std[7]=mul_mat_vec_q6_K_q8_1_cuda7; q6k_std[8]=mul_mat_vec_q6_K_q8_1_cuda8;
   q4k_glu[1]=mul_mat_vec_q4_K_q8_1_glu_cuda1; q4k_glu[2]=mul_mat_vec_q4_K_q8_1_glu_cuda2; q4k_glu[3]=mul_mat_vec_q4_K_q8_1_glu_cuda3; q4k_glu[4]=mul_mat_vec_q4_K_q8_1_glu_cuda4;
   q4k_glu[5]=mul_mat_vec_q4_K_q8_1_glu_cuda5; q4k_glu[6]=mul_mat_vec_q4_K_q8_1_glu_cuda6; q4k_glu[7]=mul_mat_vec_q4_K_q8_1_glu_cuda7; q4k_glu[8]=mul_mat_vec_q4_K_q8_1_glu_cuda8;
-  q4k_glu_pf[1]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda1; q4k_glu_pf[2]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda2; q4k_glu_pf[3]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda3; q4k_glu_pf[4]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda4;
-  q4k_glu_pf[5]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda5; q4k_glu_pf[6]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda6; q4k_glu_pf[7]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda7; q4k_glu_pf[8]=mul_mat_vec_q4_K_q8_1_glu_pf_cuda8;
 
   VAR(2,4) VAR(4,4) VAR(4,2)
   HVAR(2,4) HVAR(2,2)
@@ -432,7 +428,6 @@ int main(int argc, char **argv) {
       };
       if (s.glu) {
         run("std", [&](int i) { char *g = pool + (i % slots) * mbytes; q4k_glu[nc]<<<grid, block>>>(g, g + mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); });
-        run("pf", [&](int i) { char *g = pool + (i % slots) * mbytes; q4k_glu_pf[nc]<<<grid, block>>>(g, g + mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); });
         for (auto &v : vars) { if (nc == 1 && v.R > 1) continue; dim3 g2(s.n / v.R), b2(32, v.NW);
           run(v.name, [&](int i) { char *g = pool + (i % slots) * mbytes; v.glu[nc]<<<g2, b2>>>(g, g + mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); }); }
         for (auto &v : svars) { if (nc == 1) continue; dim3 g2(s.n / v.R), b2(32, v.NW);
@@ -446,7 +441,6 @@ int main(int argc, char **argv) {
           run(v.name, [&](int i) { v.q6[nc]<<<g2, b2>>>(pool + (i % slots) * mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); }); }
       } else {
         run("std", [&](int i) { q4k_std[nc]<<<grid, block>>>(pool + (i % slots) * mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); });
-        run("pf", [&](int i) { q4k_pf[nc]<<<grid, block>>>(pool + (i % slots) * mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); });
         for (auto &v : vars) { if (nc == 1 && v.R > 1) continue; dim3 g2(s.n / v.R), b2(32, v.NW);
           run(v.name, [&](int i) { v.q4[nc]<<<g2, b2>>>(pool + (i % slots) * mbytes, c.y, c.dst, s.k, s.n, nrows_y, s.n); }); }
       }

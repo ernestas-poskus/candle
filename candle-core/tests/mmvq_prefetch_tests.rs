@@ -1,10 +1,7 @@
 #![cfg(feature = "cuda")]
-//! Bit-exactness gate for the software-pipelined q4_K matvec:
-//! the `_pf_` kernels reorder LOADS only — every arithmetic op and its
-//! order are identical to `mul_mat_vec_q4_K_q8_1_cuda*` — so outputs must
-//! be bit-identical, not merely close. The test compares against a
-//! CPU-side reference; run it with `CANDLE_MMVQ_PREFETCH=0` and with the
-//! default and require both runs to print identical checksums.
+//! q4_K matvec shapes against a CPU-side reference. (The software-pipelined
+//! `_pf_` variants this once gated were removed: slower than the standard
+//! kernels at every decode shape on an RTX 3090.)
 
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{Device, Module, Result, Tensor};

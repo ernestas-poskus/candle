@@ -1,10 +1,10 @@
 use super::{GgmlDType, QStorage};
 use crate::quantized::k_quants::GgmlType;
-use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use crate::{CudaDevice, CudaStorage, Result};
+use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use half::f16;
 
-use cudarc::driver::{sys, CudaSlice, CudaView, DeviceSlice};
+use cudarc::driver::{CudaSlice, CudaView, DeviceSlice, sys};
 
 #[derive(Clone, Debug)]
 struct PaddedCudaSlice {
@@ -25,28 +25,10 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Shared-activation fused gate/up kernel (`*_glu_s_cuda*`), default on;
-/// `CANDLE_GLU_SHARED=0` falls back to the two-rows-per-CTA kernel.
-fn glu_shared_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CANDLE_GLU_SHARED").map_or(true, |v| v != "0"))
-}
-
 /// Output rows per CTA of the shared-activation glu kernel (4 warps x 4 rows).
 const GLU_SHARED_ROWS_PER_CTA: usize = 16;
 /// Default dynamic shared-memory limit per CTA without an opt-in attribute.
 const GLU_SHARED_MAX_SMEM: usize = 48 * 1024;
-
-/// Software-pipelined `..._pf_cuda*` q4_K matvecs, OFF by default and
-/// enabled by `CANDLE_MMVQ_PREFETCH=1`. They won −5.1% wall at 8 concurrent
-/// sequences while the standard kernels kept their accumulators in local
-/// memory; with the accumulators in registers the standard kernels are
-/// faster at every decode shape and ncols 4-8 (cold-DRAM bench on RTX 3090,
-/// `candle-kernels/bench/mmvq_bench.cu`). Both produce identical bits.
-fn mmvq_prefetch_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CANDLE_MMVQ_PREFETCH").is_ok_and(|v| v == "1"))
-}
 
 /// Grow-only per-device scratch for the activation-quantization buffer:
 /// the decode hot loop re-allocated `y_q8_1` on every
@@ -434,13 +416,6 @@ fn mul_mat_vec_via_q8_1(
         .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
         .unwrap_or(8);
     let use_volta_turing_w2 = b_size == 1 && is_k_quant && major == 7;
-    // Software-pipelined q4_K variant - x-side loads register-double-buffered
-    // one iteration ahead. Same math, same launch geometry. ncols>=5 only:
-    // measured -8.6%/launch at ncols=8 but +7% at ncols=4 (the win scales with
-    // the per-thread serial chain length; at short chains the extra register
-    // pressure dominates). Disjoint from `use_volta_turing_w2`, which is
-    // b_size == 1 only, so the two variant selections cannot both apply.
-    let use_q4k_prefetch = dtype == GgmlDType::Q4K && b_size >= 5 && mmvq_prefetch_enabled();
     // Four rows per block for the wide-K matvecs (ffn_down, K = 12288) at
     // ncols 5-8: each activation load feeds four rows instead of two. Same
     // math and summation order, so the output is bit-identical; measured
@@ -450,14 +425,15 @@ fn mul_mat_vec_via_q8_1(
     let use_rows4 = matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K)
         && b_size >= 5
         && ncols >= 8192
-        && nrows % 4 == 0
-        && !use_q4k_prefetch;
+        && nrows % 4 == 0;
     let kernel_name = if use_volta_turing_w2 {
         format!("{kernel_name}{b_size}_w2")
-    } else if use_q4k_prefetch {
-        format!("mul_mat_vec_q4_K_q8_1_pf_cuda{b_size}")
     } else if use_rows4 {
-        let t = if dtype == GgmlDType::Q4K { "q4_K" } else { "q6_K" };
+        let t = if dtype == GgmlDType::Q4K {
+            "q4_K"
+        } else {
+            "q6_K"
+        };
         format!("mul_mat_vec_{t}_q8_1_r4_cuda{b_size}")
     } else {
         format!("{kernel_name}{b_size}")
@@ -560,7 +536,7 @@ fn mul_mat_vec_glu_via_q8_1(
     // Shared-activation kernel: all b_size q8_1 columns staged in shared
     // memory, 16 rows per CTA. Falls through when the shape does not fit.
     let smem = y_size_in_bytes;
-    if glu_shared_enabled() && nrows % GLU_SHARED_ROWS_PER_CTA == 0 && smem <= GLU_SHARED_MAX_SMEM {
+    if nrows % GLU_SHARED_ROWS_PER_CTA == 0 && smem <= GLU_SHARED_MAX_SMEM {
         let func = dev.get_or_load_func(
             &format!("mul_mat_vec_q4_K_q8_1_glu_s_cuda{b_size}"),
             candle_kernels::QUANTIZED,
@@ -574,13 +550,7 @@ fn mul_mat_vec_glu_via_q8_1(
         return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
     }
 
-    // GLU chains are 2x longer per iteration (gate + up computes), so the
-    // prefetch variant applies at every batch width when enabled.
-    let kernel_name = if mmvq_prefetch_enabled() {
-        format!("mul_mat_vec_q4_K_q8_1_glu_pf_cuda{b_size}")
-    } else {
-        format!("mul_mat_vec_q4_K_q8_1_glu_cuda{b_size}")
-    };
+    let kernel_name = format!("mul_mat_vec_q4_K_q8_1_glu_cuda{b_size}");
     let func = dev.get_or_load_func(&kernel_name, candle_kernels::QUANTIZED)?;
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
