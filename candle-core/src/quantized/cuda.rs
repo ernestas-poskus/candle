@@ -1,10 +1,10 @@
 use super::{GgmlDType, QStorage};
 use crate::quantized::k_quants::GgmlType;
-use crate::{CudaDevice, CudaStorage, Result};
 use crate::{backend::BackendDevice, cuda_backend::WrapErr};
+use crate::{CudaDevice, CudaStorage, Result};
 use half::f16;
 
-use cudarc::driver::{CudaSlice, CudaView, DeviceSlice, sys};
+use cudarc::driver::{sys, CudaSlice, CudaView, DeviceSlice};
 
 #[derive(Clone, Debug)]
 struct PaddedCudaSlice {
@@ -429,11 +429,7 @@ fn mul_mat_vec_via_q8_1(
     let kernel_name = if use_volta_turing_w2 {
         format!("{kernel_name}{b_size}_w2")
     } else if use_rows4 {
-        let t = if dtype == GgmlDType::Q4K {
-            "q4_K"
-        } else {
-            "q6_K"
-        };
+        let t = if dtype == GgmlDType::Q4K { "q4_K" } else { "q6_K" };
         format!("mul_mat_vec_{t}_q8_1_r4_cuda{b_size}")
     } else {
         format!("{kernel_name}{b_size}")
