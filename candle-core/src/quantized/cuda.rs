@@ -25,6 +25,18 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Shared-activation fused gate/up kernel (`*_glu_s_cuda*`), default on;
+/// `CANDLE_GLU_SHARED=0` falls back to the two-rows-per-CTA kernel.
+fn glu_shared_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANDLE_GLU_SHARED").map_or(true, |v| v != "0"))
+}
+
+/// Output rows per CTA of the shared-activation glu kernel (4 warps x 4 rows).
+const GLU_SHARED_ROWS_PER_CTA: usize = 16;
+/// Default dynamic shared-memory limit per CTA without an opt-in attribute.
+const GLU_SHARED_MAX_SMEM: usize = 48 * 1024;
+
 /// Software-pipelined `..._pf_cuda*` q4_K matvecs, OFF by default and
 /// enabled by `CANDLE_MMVQ_PREFETCH=1`. They won −5.1% wall at 8 concurrent
 /// sequences while the standard kernels kept their accumulators in local
@@ -534,6 +546,34 @@ fn mul_mat_vec_glu_via_q8_1(
     };
     quantize_q8_1(y, y_q8_1, ncols, b_size, dev)?;
 
+    let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
+    let params = (
+        &gate.inner,
+        &up.inner,
+        y_q8_1,
+        &dst,
+        /* ncols_x */ ncols as i32,
+        /* nrows_x */ nrows as i32,
+        /* nrows_y */ ncols_padded as i32,
+        /* nrows_dst */ nrows as i32,
+    );
+    // Shared-activation kernel: all b_size q8_1 columns staged in shared
+    // memory, 16 rows per CTA. Falls through when the shape does not fit.
+    let smem = y_size_in_bytes;
+    if glu_shared_enabled() && nrows % GLU_SHARED_ROWS_PER_CTA == 0 && smem <= GLU_SHARED_MAX_SMEM {
+        let func = dev.get_or_load_func(
+            &format!("mul_mat_vec_q4_K_q8_1_glu_s_cuda{b_size}"),
+            candle_kernels::QUANTIZED,
+        )?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: ((nrows / GLU_SHARED_ROWS_PER_CTA) as u32, 1, 1),
+            block_dim: (WARP_SIZE as u32, 4, 1),
+            shared_mem_bytes: smem as u32,
+        };
+        unsafe { func.launch(cfg, params) }.w()?;
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
+
     // GLU chains are 2x longer per iteration (gate + up computes), so the
     // prefetch variant applies at every batch width when enabled.
     let kernel_name = if mmvq_prefetch_enabled() {
@@ -542,7 +582,6 @@ fn mul_mat_vec_glu_via_q8_1(
         format!("mul_mat_vec_q4_K_q8_1_glu_cuda{b_size}")
     };
     let func = dev.get_or_load_func(&kernel_name, candle_kernels::QUANTIZED)?;
-    let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32 + 1) / 2, 4),
@@ -554,17 +593,6 @@ fn mul_mat_vec_glu_via_q8_1(
         block_dim: (WARP_SIZE as u32, nwarps, 1),
         shared_mem_bytes: 0,
     };
-
-    let params = (
-        &gate.inner,
-        &up.inner,
-        y_q8_1,
-        &dst,
-        /* ncols_x */ ncols as i32,
-        /* nrows_x */ nrows as i32,
-        /* nrows_y */ ncols_padded as i32,
-        /* nrows_dst */ nrows as i32,
-    );
     unsafe { func.launch(cfg, params) }.w()?;
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
