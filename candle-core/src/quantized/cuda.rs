@@ -317,6 +317,7 @@ fn dequantize_mul_mat_vec(
     dtype: GgmlDType,
     ncols: usize,
     nrows: usize,
+    b_size: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
     use cudarc::driver::LaunchAsync;
@@ -325,7 +326,10 @@ fn dequantize_mul_mat_vec(
     if data_elems < ncols * nrows {
         crate::bail!("unexpected data size {}, ncols {ncols} {nrows}", data_elems)
     }
-    if y.len() != ncols {
+    if b_size > 1 && dtype == GgmlDType::Q5K {
+        crate::bail!("batched dmmv does not support q5_K")
+    }
+    if y.len() != ncols * b_size {
         crate::bail!("unexpected y size {}, ncols {ncols} {nrows}", y.len())
     }
     let kernel_name = match dtype {
@@ -342,10 +346,13 @@ fn dequantize_mul_mat_vec(
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, candle_kernels::QUANTIZED)?;
-    let dst = unsafe { dev.alloc::<f32>(nrows).w()? };
+    // One grid row per input row: the kernels offset y and dst by blockIdx.y,
+    // so the weights are dequantized on the fly against F32 activations for
+    // every row, with no Q8_1 activation quantization and no dense copy.
+    let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
     let block_num_y = ceil_div(nrows, GGML_CUDA_MMV_Y);
     let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (block_num_y as u32, 1, 1),
+        grid_dim: (block_num_y as u32, b_size as u32, 1),
         block_dim: (WARP_SIZE as u32, GGML_CUDA_MMV_Y as u32, 1),
         shared_mem_bytes: 0,
     };
@@ -369,6 +376,9 @@ fn mul_mat_vec_via_q8_1(
     let data_elems = data.len / dtype.type_size() * dtype.block_size();
     if data_elems < ncols * nrows {
         crate::bail!("unexpected data size {}, ncols {ncols} {nrows}", data_elems)
+    }
+    if b_size > 1 && dtype == GgmlDType::Q5K {
+        crate::bail!("batched dmmv does not support q5_K")
     }
     if y.len() != ncols * b_size {
         crate::bail!("unexpected y size {}, ncols {ncols} {nrows}", y.len())
@@ -425,7 +435,11 @@ fn mul_mat_vec_via_q8_1(
     let kernel_name = if use_volta_turing_w2 {
         format!("{kernel_name}{b_size}_w2")
     } else if use_rows4 {
-        let t = if dtype == GgmlDType::Q4K { "q4_K" } else { "q6_K" };
+        let t = if dtype == GgmlDType::Q4K {
+            "q4_K"
+        } else {
+            "q6_K"
+        };
         format!("mul_mat_vec_{t}_q8_1_r4_cuda{b_size}")
     } else {
         format!("{kernel_name}{b_size}")
@@ -489,6 +503,9 @@ fn mul_mat_vec_glu_via_q8_1(
                 data_elems
             )
         }
+    }
+    if b_size > 1 && dtype == GgmlDType::Q5K {
+        crate::bail!("batched dmmv does not support q5_K")
     }
     if y.len() != ncols * b_size {
         crate::bail!(
@@ -916,7 +933,13 @@ impl QCudaStorage {
             return self.dequantize_matmul(self_shape, storage, layout);
         }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            1
+            // The batched DMMV kernel takes up to 8 rows, like MMVQ; the
+            // q5_K kernel has no row count and stays single-row.
+            if self.dtype == GgmlDType::Q5K {
+                1
+            } else {
+                8
+            }
         } else {
             // mmvq-vs-mmq crossover. mmvq's per-launch time grows ~linearly
             // with ncols (per-column serial dot chains), flattening batched
@@ -1313,7 +1336,15 @@ impl QCudaStorage {
         }
 
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            dequantize_mul_mat_vec(&self.data, rhs, self.dtype, ncols, nrows, self.device())?
+            dequantize_mul_mat_vec(
+                &self.data,
+                rhs,
+                self.dtype,
+                ncols,
+                nrows,
+                b_size,
+                self.device(),
+            )?
         } else {
             mul_mat_vec_via_q8_1(
                 &self.data,
@@ -1466,12 +1497,52 @@ mod test {
             /* dtype */ GgmlDType::Q4_0,
             /* ncols */ ncols,
             /* nrows */ 1,
+            /* b_size */ 1,
             &dev,
         )?;
         let vs = cuda_storage.as_cuda_slice::<f32>()?;
         let vs = dev.dtoh_sync_copy(&vs.slice(..)).unwrap();
         assert_eq!(vs.len(), 1);
         assert_eq!(vs[0], 5561851.0);
+        Ok(())
+    }
+
+    /// Batched decode (several sequences per step) must get the same F32-
+    /// activation dot products as decoding each row alone: the batched DMMV
+    /// only offsets y and dst per grid row. Checked for the tensor types the
+    /// MOSS GGUFs use, against one single-row launch per row.
+    #[test]
+    fn cuda_batched_dmmv_matches_row_by_row() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let (ncols, nrows, b) = (512usize, 96usize, 5usize);
+        let w: Vec<f32> = (0..ncols * nrows)
+            .map(|i| ((i * 37 % 101) as f32 - 50.) / 25.)
+            .collect();
+        let w = dev.htod_sync_copy(&w).w()?;
+        let ys: Vec<f32> = (0..ncols * b)
+            .map(|i| ((i * 13 % 29) as f32 - 14.) / 7.)
+            .collect();
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0] {
+            let mut xs = QCudaStorage::zeros(&dev, ncols * nrows, dtype)?;
+            xs.quantize(&CudaStorage::wrap_cuda_slice(w.clone(), dev.clone()))?;
+            let y = dev.htod_sync_copy(&ys).w()?;
+            let batched = dequantize_mul_mat_vec(&xs.data, &y, dtype, ncols, nrows, b, &dev)?;
+            let batched = dev
+                .dtoh_sync_copy(&batched.as_cuda_slice::<f32>()?.slice(..))
+                .unwrap();
+            for r in 0..b {
+                let y1 = dev.htod_sync_copy(&ys[r * ncols..(r + 1) * ncols]).w()?;
+                let one = dequantize_mul_mat_vec(&xs.data, &y1, dtype, ncols, nrows, 1, &dev)?;
+                let one = dev
+                    .dtoh_sync_copy(&one.as_cuda_slice::<f32>()?.slice(..))
+                    .unwrap();
+                assert_eq!(
+                    &batched[r * nrows..(r + 1) * nrows],
+                    &one[..],
+                    "{dtype:?} row {r}"
+                );
+            }
+        }
         Ok(())
     }
 

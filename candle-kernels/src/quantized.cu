@@ -1158,6 +1158,9 @@ DEQUANTIZE(q8_0)
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __device__ void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows) {
+    // Batched launch: gridDim.y = rows of y, each laid out [ncols]; dst is [gridDim.y, nrows].
+    y += blockIdx.y * ncols;
+    dst += blockIdx.y * nrows;
     // qk = quantized weights per x block
     // qr = number of quantized weights per data value in x block
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
@@ -1244,6 +1247,8 @@ extern "C" __global__ void dequantize_mul_mat_vec_q8_0_cuda(const void * vx, con
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_q2_k(const void * __restrict__ vx, const float * __restrict__ yy, float * __restrict__ dst, const int ncols, int nrows) {
+    yy += blockIdx.y * ncols;
+    dst += blockIdx.y * nrows;
 
     static_assert(16%K_QUANTS_PER_ITERATION == 0, "16 must be divisible by K_QUANTS_PER_ITERATION");
 
@@ -1350,6 +1355,8 @@ extern "C" __global__ void dequantize_mul_mat_vec_q2_k(const void * __restrict__
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_q3_k(const void * __restrict__ vx, const float * __restrict__ yy, float * __restrict__ dst, const int ncols, int nrows) {
+    yy += blockIdx.y * ncols;
+    dst += blockIdx.y * nrows;
 
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     if (row > nrows) return;
@@ -1454,6 +1461,8 @@ extern "C" __global__ void dequantize_mul_mat_vec_q3_k(const void * __restrict__
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_q4_k(const void * __restrict__ vx, const float * __restrict__ yy, float * __restrict__ dst, const int ncols, int nrows) {
+    yy += blockIdx.y * ncols;
+    dst += blockIdx.y * nrows;
 
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     if (row > nrows) return;
@@ -1706,6 +1715,8 @@ extern "C" __global__ void dequantize_mul_mat_vec_q5_k(const void * __restrict__
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const float * __restrict__ yy, float * __restrict__ dst, const int ncols, int nrows) {
+    yy += blockIdx.y * ncols;
+    dst += blockIdx.y * nrows;
 
     static_assert(16%K_QUANTS_PER_ITERATION == 0, "16 must be divisible by K_QUANTS_PER_ITERATION");
 
