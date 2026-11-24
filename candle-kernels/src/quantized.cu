@@ -1826,6 +1826,197 @@ extern "C" __global__ void dequantize_mul_mat_vec_q6_k(const void * __restrict__
     }
 }
 
+
+// Batched DMMV with weight reuse: each thread decodes its slice of a weight
+// block once and applies it to up to DMMV_MAX_NB activation rows (y is
+// [nb, ncols], dst is [nb, nrows]). Per row the float operations run in the
+// same order as the single-row kernels above, so each output equals what a
+// single-row launch computes for that row.
+#define DMMV_MAX_NB 8
+
+template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
+static __device__ void dequantize_mul_mat_vec_nb(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows, const int nb) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    if (row >= nrows) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int iter_stride = 2*GGML_CUDA_DMMV_X;
+    const int vals_per_iter = iter_stride / WARP_SIZE;
+    const int y_offset = qr == 1 ? 1 : qk/2;
+
+    float tmp[DMMV_MAX_NB];
+#pragma unroll
+    for (int r = 0; r < DMMV_MAX_NB; ++r) tmp[r] = 0.0f;
+
+    for (int i = 0; i < ncols; i += iter_stride) {
+        const int col = i + vals_per_iter*tid;
+        const int ib = (row*ncols + col)/qk;
+        const int iqs = (col%qk)/qr;
+        const int iybs = col - col%qk;
+#pragma unroll
+        for (int j = 0; j < vals_per_iter; j += 2) {
+            dfloat2 v;
+            dequantize_kernel(vx, ib, iqs + j/qr, v);
+#pragma unroll
+            for (int r = 0; r < DMMV_MAX_NB; ++r) {
+                if (r < nb) {
+                    const dfloat * yr = y + r*ncols;
+                    tmp[r] += v.x * yr[iybs + iqs + j/qr + 0];
+                    tmp[r] += v.y * yr[iybs + iqs + j/qr + y_offset];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < DMMV_MAX_NB; ++r) {
+        if (r < nb) {
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                tmp[r] += __shfl_xor_sync(0xffffffff, tmp[r], mask, 32);
+            }
+            if (tid == 0) {
+                dst[r*nrows + row] = tmp[r];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void dequantize_mul_mat_vec_q8_0_nb(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows, const int nb) {
+    dequantize_mul_mat_vec_nb<QK8_0, QR8_0, dequantize_q8_0>(vx, y, dst, ncols, nrows, nb);
+}
+
+#if QK_K == 256 && K_QUANTS_PER_ITERATION == 2
+extern "C" __global__ void dequantize_mul_mat_vec_q4_k_nb(const void * __restrict__ vx, const float * __restrict__ yy, float * __restrict__ dst, const int ncols, int nrows, const int nb) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    if (row >= nrows) return;
+    const int num_blocks_per_row = ncols / QK_K;
+    const block_q4_K * x = (const block_q4_K *)vx + row*num_blocks_per_row;
+
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+    const int tid = threadIdx.x/K_QUANTS_PER_ITERATION;
+    const int ix  = threadIdx.x%K_QUANTS_PER_ITERATION;
+    const int step = 8/K_QUANTS_PER_ITERATION;
+    const int il  = tid/step;
+    const int ir  = tid - step*il;
+    const int n   = 2 * K_QUANTS_PER_ITERATION;
+    const int im = il/2;
+    const int in = il%2;
+    const int l0 = n*(2*ir + in);
+    const int q_offset = 32*im + l0;
+    const int y_offset = 64*im + l0;
+
+    uint16_t aux[4];
+    const uint8_t * sc = (const uint8_t *)aux;
+    uint32_t q32[4];
+    const uint8_t * q4 = (const uint8_t *)q32;
+
+    float tmp[DMMV_MAX_NB];
+#pragma unroll
+    for (int r = 0; r < DMMV_MAX_NB; ++r) tmp[r] = 0.0f;
+
+    for (int i = ix; i < num_blocks_per_row; i += K_QUANTS_PER_ITERATION) {
+        const float dall = __low2half(x[i].dm);
+        const float dmin = __high2half(x[i].dm);
+
+        const uint16_t * a = (const uint16_t *)x[i].scales;
+        aux[0] = a[im+0] & kmask1;
+        aux[1] = a[im+2] & kmask1;
+        aux[2] = ((a[im+4] >> 0) & kmask2) | ((a[im+0] & kmask3) >> 2);
+        aux[3] = ((a[im+4] >> 4) & kmask2) | ((a[im+2] & kmask3) >> 2);
+
+        const uint32_t * q1 = (const uint32_t *)(x[i].qs + q_offset);
+        const uint32_t * q2 = q1 + 16;
+        q32[0] = q1[0] & 0x0f0f0f0f;
+        q32[1] = q1[0] & 0xf0f0f0f0;
+        q32[2] = q2[0] & 0x0f0f0f0f;
+        q32[3] = q2[0] & 0xf0f0f0f0;
+
+#pragma unroll
+        for (int r = 0; r < DMMV_MAX_NB; ++r) {
+            if (r < nb) {
+                const float * y1 = yy + r*ncols + i*QK_K + y_offset;
+                const float * y2 = y1 + 128;
+                float4 s = {0.f, 0.f, 0.f, 0.f};
+                float smin = 0;
+                for (int l = 0; l < 4; ++l) {
+                    s.x += y1[l] * q4[l+0]; s.y += y1[l+32] * q4[l+ 4];
+                    s.z += y2[l] * q4[l+8]; s.w += y2[l+32] * q4[l+12];
+                    smin += y1[l] * sc[2] + y1[l+32] * sc[3] + y2[l] * sc[6] + y2[l+32] * sc[7];
+                }
+                tmp[r] += dall * (s.x * sc[0] + s.y * sc[1] * 1.f/16.f + s.z * sc[4] + s.w * sc[5] * 1.f/16.f) - dmin * smin;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < DMMV_MAX_NB; ++r) {
+        if (r < nb) {
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                tmp[r] += __shfl_xor_sync(0xffffffff, tmp[r], mask, 32);
+            }
+            if (tid == 0) dst[r*nrows + row] = tmp[r];
+        }
+    }
+}
+
+extern "C" __global__ void dequantize_mul_mat_vec_q6_k_nb(const void * __restrict__ vx, const float * __restrict__ yy, float * __restrict__ dst, const int ncols, int nrows, const int nb) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    if (row >= nrows) return;
+    const int num_blocks_per_row = ncols / QK_K;
+    const block_q6_K * x = (const block_q6_K *)vx + row*num_blocks_per_row;
+
+    const int tid = threadIdx.x/K_QUANTS_PER_ITERATION;
+    const int ix  = threadIdx.x%K_QUANTS_PER_ITERATION;
+    const int step = 16/K_QUANTS_PER_ITERATION;
+    const int im = tid/step;
+    const int in = tid - step*im;
+    const int l0 = 4 * in;
+    const int is = in / 4;
+    const int ql_offset = 64*im + l0;
+    const int qh_offset = 32*im + l0;
+    const int s_offset  =  8*im + is;
+    const int y_offset = 128*im + l0;
+
+    float tmp[DMMV_MAX_NB];
+#pragma unroll
+    for (int r = 0; r < DMMV_MAX_NB; ++r) tmp[r] = 0.0f;
+
+    for (int i = ix; i < num_blocks_per_row; i += K_QUANTS_PER_ITERATION) {
+        const uint8_t * ql = x[i].ql + ql_offset;
+        const uint8_t * qh = x[i].qh + qh_offset;
+        const int8_t  * s  = x[i].scales + s_offset;
+        const float d = x[i].d;
+#pragma unroll
+        for (int r = 0; r < DMMV_MAX_NB; ++r) {
+            if (r < nb) {
+                const float * y = yy + r*ncols + i * QK_K + y_offset;
+                float sum = 0;
+                for (int l = 0; l < 4; ++l) {
+                    sum += y[l+ 0] * s[0] * d * ((int8_t)((ql[l+ 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32)
+                         + y[l+32] * s[2] * d * ((int8_t)((ql[l+32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32)
+                         + y[l+64] * s[4] * d * ((int8_t)((ql[l+ 0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32)
+                         + y[l+96] * s[6] * d * ((int8_t)((ql[l+32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+                }
+                tmp[r] += sum;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < DMMV_MAX_NB; ++r) {
+        if (r < nb) {
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                tmp[r] += __shfl_xor_sync(0xffffffff, tmp[r], mask, 32);
+            }
+            if (tid == 0) dst[r*nrows + row] = tmp[r];
+        }
+    }
+}
+#endif
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 

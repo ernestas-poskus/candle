@@ -345,12 +345,39 @@ fn dequantize_mul_mat_vec(
         GgmlDType::Q6K => "dequantize_mul_mat_vec_q6_k",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
+    let block_num_y = ceil_div(nrows, GGML_CUDA_MMV_Y);
+    // Weight-reuse kernels: each weight block is decoded once and applied to
+    // all b_size rows, so a batched step reads the weights once.
+    let reuse_name = match dtype {
+        GgmlDType::Q8_0 => Some("dequantize_mul_mat_vec_q8_0_nb"),
+        GgmlDType::Q4K => Some("dequantize_mul_mat_vec_q4_k_nb"),
+        GgmlDType::Q6K => Some("dequantize_mul_mat_vec_q6_k_nb"),
+        _ => None,
+    };
+    if let (true, Some(name)) = (b_size > 1, reuse_name) {
+        let func = dev.get_or_load_func(name, candle_kernels::QUANTIZED)?;
+        let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (block_num_y as u32, 1, 1),
+            block_dim: (WARP_SIZE as u32, GGML_CUDA_MMV_Y as u32, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = (
+            &data.inner,
+            y,
+            &dst,
+            ncols as i32,
+            nrows as i32,
+            b_size as i32,
+        );
+        unsafe { func.launch(cfg, params) }.w()?;
+        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+    }
     let func = dev.get_or_load_func(kernel_name, candle_kernels::QUANTIZED)?;
     // One grid row per input row: the kernels offset y and dst by blockIdx.y,
     // so the weights are dequantized on the fly against F32 activations for
     // every row, with no Q8_1 activation quantization and no dense copy.
     let dst = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
-    let block_num_y = ceil_div(nrows, GGML_CUDA_MMV_Y);
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (block_num_y as u32, b_size as u32, 1),
         block_dim: (WARP_SIZE as u32, GGML_CUDA_MMV_Y as u32, 1),
@@ -1514,33 +1541,35 @@ mod test {
     #[test]
     fn cuda_batched_dmmv_matches_row_by_row() -> Result<()> {
         let dev = CudaDevice::new(0)?;
-        let (ncols, nrows, b) = (512usize, 96usize, 5usize);
-        let w: Vec<f32> = (0..ncols * nrows)
-            .map(|i| ((i * 37 % 101) as f32 - 50.) / 25.)
-            .collect();
-        let w = dev.htod_sync_copy(&w).w()?;
-        let ys: Vec<f32> = (0..ncols * b)
-            .map(|i| ((i * 13 % 29) as f32 - 14.) / 7.)
-            .collect();
-        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0] {
-            let mut xs = QCudaStorage::zeros(&dev, ncols * nrows, dtype)?;
-            xs.quantize(&CudaStorage::wrap_cuda_slice(w.clone(), dev.clone()))?;
-            let y = dev.htod_sync_copy(&ys).w()?;
-            let batched = dequantize_mul_mat_vec(&xs.data, &y, dtype, ncols, nrows, b, &dev)?;
-            let batched = dev
-                .dtoh_sync_copy(&batched.as_cuda_slice::<f32>()?.slice(..))
-                .unwrap();
-            for r in 0..b {
-                let y1 = dev.htod_sync_copy(&ys[r * ncols..(r + 1) * ncols]).w()?;
-                let one = dequantize_mul_mat_vec(&xs.data, &y1, dtype, ncols, nrows, 1, &dev)?;
-                let one = dev
-                    .dtoh_sync_copy(&one.as_cuda_slice::<f32>()?.slice(..))
+        let (ncols, nrows) = (512usize, 96usize);
+        for b in [3usize, 8] {
+            let w: Vec<f32> = (0..ncols * nrows)
+                .map(|i| ((i * 37 % 101) as f32 - 50.) / 25.)
+                .collect();
+            let w = dev.htod_sync_copy(&w).w()?;
+            let ys: Vec<f32> = (0..ncols * 8)
+                .map(|i| ((i * 13 % 29) as f32 - 14.) / 7.)
+                .collect();
+            for dtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0] {
+                let mut xs = QCudaStorage::zeros(&dev, ncols * nrows, dtype)?;
+                xs.quantize(&CudaStorage::wrap_cuda_slice(w.clone(), dev.clone()))?;
+                let y = dev.htod_sync_copy(&ys[..ncols * b]).w()?;
+                let batched = dequantize_mul_mat_vec(&xs.data, &y, dtype, ncols, nrows, b, &dev)?;
+                let batched = dev
+                    .dtoh_sync_copy(&batched.as_cuda_slice::<f32>()?.slice(..))
                     .unwrap();
-                assert_eq!(
-                    &batched[r * nrows..(r + 1) * nrows],
-                    &one[..],
-                    "{dtype:?} row {r}"
-                );
+                for r in 0..b {
+                    let y1 = dev.htod_sync_copy(&ys[r * ncols..(r + 1) * ncols]).w()?;
+                    let one = dequantize_mul_mat_vec(&xs.data, &y1, dtype, ncols, nrows, 1, &dev)?;
+                    let one = dev
+                        .dtoh_sync_copy(&one.as_cuda_slice::<f32>()?.slice(..))
+                        .unwrap();
+                    assert_eq!(
+                        &batched[r * nrows..(r + 1) * nrows],
+                        &one[..],
+                        "{dtype:?} b {b} row {r}"
+                    );
+                }
             }
         }
         Ok(())
